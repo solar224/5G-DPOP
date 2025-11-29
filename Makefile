@@ -11,7 +11,6 @@ GOMOD=$(GOCMD) mod
 # Binary names
 AGENT_BINARY=bin/agent
 API_SERVER_BINARY=bin/api-server
-FAULT_INJECTOR_BINARY=bin/fault-injector
 
 # eBPF parameters
 CLANG ?= clang
@@ -38,16 +37,13 @@ ebpf-gen:
 	cd internal/ebpf && go generate ./...
 
 # Build all Go binaries
-build: build-agent build-api-server build-fault-injector
+build: build-agent build-api-server
 
 build-agent:
 	$(GOBUILD) -o $(AGENT_BINARY) ./cmd/agent
 
 build-api-server:
 	$(GOBUILD) -o $(API_SERVER_BINARY) ./cmd/api-server
-
-build-fault-injector:
-	$(GOBUILD) -o $(FAULT_INJECTOR_BINARY) ./cmd/fault-injector
 
 # Build and run
 run-agent: build-agent
@@ -91,7 +87,6 @@ clean:
 	$(GOCLEAN)
 	rm -f $(AGENT_BINARY)
 	rm -f $(API_SERVER_BINARY)
-	rm -f $(FAULT_INJECTOR_BINARY)
 	rm -f $(BPF_OBJ_DIR)/*.o
 
 # Help

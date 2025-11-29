@@ -205,7 +205,7 @@ DN 回應資料
 | **eBPF Agent** | Go + cilium/ebpf | 載入 eBPF 程式、讀取 kernel maps、匯出 metrics | 9100 (Prometheus) |
 | **PFCP Sniffer** | Go + gopacket | 監聽 PFCP 訊息、解析 Session、建立 TEID 對應 | 8805 (監聽) |
 | **API Server** | Go + Gin | REST API + WebSocket 即時串流 | 8080 |
-| **Web Frontend** | React + TypeScript + Vite | 可視化儀表板 | 3000 |
+| **Web Frontend** | React + TypeScript + Vite | 可視化儀表板 | 3000 (dev) |
 | **Prometheus** | Docker | 時序資料庫、指標儲存 | 9090 |
 | **Otel Collector** | Docker | OpenTelemetry 收集器 | 4317 |
 
@@ -368,8 +368,12 @@ lsmod | grep gtp5g
 
 ```bash
 cd ~
+# 若尚未 clone 專案
 git clone https://github.com/solar224/CNDI-Final.git
 cd CNDI-Final
+
+# 若已有專案，確認在正確目錄
+cd ~/CNDI-Final
 ```
 
 #### 2.2 執行環境設定腳本
@@ -409,13 +413,11 @@ make build
 # 輸出:
 # go build -o bin/agent ./cmd/agent
 # go build -o bin/api-server ./cmd/api-server
-# go build -o bin/fault-injector ./cmd/fault-injector
 
 # 確認編譯結果
 ls -la bin/
-# -rwxr-xr-x 1 user user 15M Nov 29 10:00 agent
-# -rwxr-xr-x 1 user user 12M Nov 29 10:00 api-server
-# -rwxr-xr-x 1 user user  8M Nov 29 10:00 fault-injector
+# -rwxrwxr-x 1 user user 16M Nov 29 10:00 agent
+# -rwxrwxr-x 1 user user 13M Nov 29 10:00 api-server
 ```
 
 #### 2.6 安裝前端依賴
@@ -453,9 +455,9 @@ docker compose -f deployments/docker-compose.yaml ps
 curl http://localhost:9090/-/healthy
 # 輸出: Prometheus Server is Healthy.
 
-# 檢查 Otel Collector
-curl http://localhost:13133/
-# 輸出: {"status":"Server available"...}
+# 檢查 Otel Collector health
+curl http://localhost:13133
+# 輸出: {"status":"Server available","upSince":"...","uptime":"..."}
 ```
 
 ---
@@ -536,14 +538,16 @@ cd ~/CNDI-Final/web
 npm run dev
 
 # 預期輸出:
-#   VITE v5.4.21  ready in 500 ms
-#   ➜  Local:   http://localhost:3000/
-#   ➜  Network: http://192.168.x.x:3000/
+#   VITE v5.4.x  ready in xxx ms
+#   ➨  Local:   http://localhost:3000/
+#   ➨  Network: use --host to expose
 ```
 
 #### 4.6 開啟瀏覽器
 
 在瀏覽器中開啟 http://localhost:3000，即可看到 CNDI-Final 監控儀表板。
+
+> **注意**: Vite 開發服務器配置在 `web/vite.config.ts` 中，預設端口為 3000。
 
 ---
 
@@ -611,14 +615,22 @@ curl -X POST http://localhost:8080/api/v1/fault/inject \
 ### 常用操作指令
 
 ```bash
-# 一鍵啟動所有服務
-make compose-up && sudo ./bin/agent &
-./bin/api-server &
-cd web && npm run dev &
+# 一鍵啟動所有服務 (建議在不同終端機分別執行)
+# 終端機 1: 啟動 Docker Stack
+make compose-up
+
+# 終端機 2: 啟動 Agent (需要 root)
+sudo ./bin/agent
+
+# 終端機 3: 啟動 API Server
+./bin/api-server
+
+# 終端機 4: 啟動 Web Frontend
+cd web && npm run dev
 
 # 停止所有服務
-pkill agent
-pkill api-server
+pkill -f agent
+pkill -f api-server
 make compose-down
 
 # 查看 Agent 即時日誌
