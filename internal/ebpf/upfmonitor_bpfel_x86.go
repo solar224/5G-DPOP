@@ -12,6 +12,18 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type upfMonitorPendingPktInfo struct {
+	Teid      uint32
+	SrcIp     uint32
+	DstIp     uint32
+	SrcPort   uint16
+	DstPort   uint16
+	PktLen    uint32
+	Direction uint8
+	Valid     uint8
+	Pad       [2]uint8
+}
+
 type upfMonitorSessionInfo struct {
 	Seid      uint64
 	UeIp      uint32
@@ -74,6 +86,8 @@ type upfMonitorProgramSpecs struct {
 	KretprobeGtp5gDevXmit   *ebpf.ProgramSpec `ebpf:"kretprobe_gtp5g_dev_xmit"`
 	KretprobeGtp5gEncapRecv *ebpf.ProgramSpec `ebpf:"kretprobe_gtp5g_encap_recv"`
 	KretprobeIpForward      *ebpf.ProgramSpec `ebpf:"kretprobe_ip_forward"`
+	KretprobePdrFindByGtp1u *ebpf.ProgramSpec `ebpf:"kretprobe_pdr_find_by_gtp1u"`
+	KretprobePdrFindByIpv4  *ebpf.ProgramSpec `ebpf:"kretprobe_pdr_find_by_ipv4"`
 	TracepointKfreeSkb      *ebpf.ProgramSpec `ebpf:"tracepoint_kfree_skb"`
 }
 
@@ -84,6 +98,7 @@ type upfMonitorMapSpecs struct {
 	AgentConfig    *ebpf.MapSpec `ebpf:"agent_config"`
 	DropEvents     *ebpf.MapSpec `ebpf:"drop_events"`
 	PacketEvents   *ebpf.MapSpec `ebpf:"packet_events"`
+	PendingPkts    *ebpf.MapSpec `ebpf:"pending_pkts"`
 	TeidSessionMap *ebpf.MapSpec `ebpf:"teid_session_map"`
 	TeidStats      *ebpf.MapSpec `ebpf:"teid_stats"`
 	TrafficStats   *ebpf.MapSpec `ebpf:"traffic_stats"`
@@ -112,6 +127,7 @@ type upfMonitorMaps struct {
 	AgentConfig    *ebpf.Map `ebpf:"agent_config"`
 	DropEvents     *ebpf.Map `ebpf:"drop_events"`
 	PacketEvents   *ebpf.Map `ebpf:"packet_events"`
+	PendingPkts    *ebpf.Map `ebpf:"pending_pkts"`
 	TeidSessionMap *ebpf.Map `ebpf:"teid_session_map"`
 	TeidStats      *ebpf.Map `ebpf:"teid_stats"`
 	TrafficStats   *ebpf.Map `ebpf:"traffic_stats"`
@@ -123,6 +139,7 @@ func (m *upfMonitorMaps) Close() error {
 		m.AgentConfig,
 		m.DropEvents,
 		m.PacketEvents,
+		m.PendingPkts,
 		m.TeidSessionMap,
 		m.TeidStats,
 		m.TrafficStats,
@@ -142,6 +159,8 @@ type upfMonitorPrograms struct {
 	KretprobeGtp5gDevXmit   *ebpf.Program `ebpf:"kretprobe_gtp5g_dev_xmit"`
 	KretprobeGtp5gEncapRecv *ebpf.Program `ebpf:"kretprobe_gtp5g_encap_recv"`
 	KretprobeIpForward      *ebpf.Program `ebpf:"kretprobe_ip_forward"`
+	KretprobePdrFindByGtp1u *ebpf.Program `ebpf:"kretprobe_pdr_find_by_gtp1u"`
+	KretprobePdrFindByIpv4  *ebpf.Program `ebpf:"kretprobe_pdr_find_by_ipv4"`
 	TracepointKfreeSkb      *ebpf.Program `ebpf:"tracepoint_kfree_skb"`
 }
 
@@ -155,6 +174,8 @@ func (p *upfMonitorPrograms) Close() error {
 		p.KretprobeGtp5gDevXmit,
 		p.KretprobeGtp5gEncapRecv,
 		p.KretprobeIpForward,
+		p.KretprobePdrFindByGtp1u,
+		p.KretprobePdrFindByIpv4,
 		p.TracepointKfreeSkb,
 	)
 }

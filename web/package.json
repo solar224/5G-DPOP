@@ -1,7 +1,7 @@
 {
-    "name": "cndi-final-web",
+    "name": "5g-dpop-web",
     "version": "1.0.0",
-    "description": "CNDI-Final UPF Observability Dashboard",
+    "description": "5G-DPOP UPF Observability Dashboard",
     "type": "module",
     "scripts": {
         "dev": "vite",

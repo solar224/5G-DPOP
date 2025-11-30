@@ -1,4 +1,4 @@
-# CNDI-Final: 5G UPF Data Plane Observability Platform
+# 5G-DPOP: 5G UPF Data Plane Observability Platform
 
 A non-intrusive 5G Core Network User Plane observability platform based on **eBPF** technology. This project leverages Linux eBPF kprobe mechanisms to directly hook `gtp5g` kernel module functions, enabling real-time traffic monitoring, packet drop detection, and PFCP session correlation analysis for free5GC UPF, without modifying any free5GC or gtp5g source code.
 
@@ -29,7 +29,7 @@ flowchart TB
         end
         
         subgraph UserSpace["User Space"]
-            subgraph Agent["CNDI-Final Agent (Go)"]
+            subgraph Agent["5G-DPOP Agent (Go)"]
                 Loader["eBPF Loader<br/>(cilium/ebpf)"]
                 Sniffer["PFCP Sniffer<br/>(gopacket)"]
                 Metrics["Metrics Collector<br/>(Prometheus)"]
@@ -330,11 +330,11 @@ lsmod | grep gtp5g
 ```bash
 cd ~
 # Clone the project if not already done
-git clone https://github.com/solar224/CNDI-Final.git
-cd CNDI-Final
+git clone https://github.com/solar224/5G-DPOP.git
+cd 5G-DPOP
 
 # If project exists, ensure you're in the correct directory
-cd ~/CNDI-Final
+cd ~/5G-DPOP
 ```
 
 #### 2.2 Run Environment Setup Script
@@ -423,20 +423,20 @@ curl http://localhost:13133
 
 ---
 
-### Step 4: Start CNDI-Final Platform
+### Step 4: Start 5G-DPOP Platform
 
 #### 4.1 Start eBPF Agent (Requires Root)
 
 ```bash
 # Open a new terminal
-cd ~/CNDI-Final
+cd ~/5G-DPOP
 
 # Run Agent with root privileges
 sudo ./bin/agent
 
 # Expected output:
 # ============================================================
-#     CNDI-Final: UPF Data Plane Observability Agent
+#     5G-DPOP: UPF Data Plane Observability Agent
 # ============================================================
 # [OK] eBPF programs loaded successfully
 # [OK] Event loop started
@@ -465,14 +465,14 @@ curl http://localhost:9100/metrics | grep upf_
 
 ```bash
 # Open another terminal
-cd ~/CNDI-Final
+cd ~/5G-DPOP
 
 # Start API Server
 ./bin/api-server
 
 # Expected output:
 # ============================================================
-#     CNDI-Final: Backend API Server
+#     5G-DPOP: Backend API Server
 # ============================================================
 # [INFO] Starting API server on :8080
 ```
@@ -493,7 +493,7 @@ curl http://localhost:8080/api/v1/metrics/traffic
 
 ```bash
 # Open another terminal
-cd ~/CNDI-Final/web
+cd ~/5G-DPOP/web
 
 # Start development server
 npm run dev
@@ -506,7 +506,7 @@ npm run dev
 
 #### 4.6 Open Browser
 
-Open http://localhost:3000 in your browser to see the CNDI-Final monitoring dashboard.
+Open http://localhost:3000 in your browser to see the 5G-DPOP monitoring dashboard.
 
 > **Note**: The Vite development server is configured in `web/vite.config.ts`, with default port 3000.
 
@@ -616,28 +616,17 @@ ping -I uesimtun{X} 8.8.8.8
 for i in {0..4}; do ping -I uesimtun$i 8.8.8.8 -c 100 & done
 # -------------------------------------------------------
 
-# Injection Testing
-# Inject 5 drop events
-curl -X POST http://localhost:9100/api/demo/inject-drop \
-  -H "Content-Type: application/json" \
-  -d '{"count": 5}'
 
-# Inject 3 sessions
-curl -X POST http://localhost:9100/api/demo/inject-session \
-  -H "Content-Type: application/json" \
-  -d '{"count": 3}'
+# drop test
+# reference:./scripts/drop_tests/README.md
 
-# Inject random drops
-curl -X POST http://localhost:9100/api/demo/inject-drop \
-  -H "Content-Type: application/json" \
-  -d '{"count": 20, "reason": "random"}'
 ```
 
 ---
 
 ## Conclusion
 
-CNDI-Final provides a complete 5G UPF data plane observability solution. Its core value lies in:
+5G-DPOP provides a complete 5G UPF data plane observability solution. Its core value lies in:
 
 ### Technical Innovation
 

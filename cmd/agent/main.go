@@ -16,8 +16,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/solar224/CNDI-Final/internal/ebpf"
-	"github.com/solar224/CNDI-Final/internal/pfcp"
+	"github.com/solar224/5G-DPOP/internal/ebpf"
+	"github.com/solar224/5G-DPOP/internal/pfcp"
 )
 
 var (
@@ -65,6 +65,9 @@ var (
 	// PFCP correlation
 	pfcpCorrelation *pfcp.Correlation
 
+	// Global eBPF loader for API access
+	ebpfLoader *ebpf.Loader
+
 	// Previous counter values for calculating deltas
 	prevUplinkPackets   uint64
 	prevDownlinkPackets uint64
@@ -90,6 +93,8 @@ type SessionJSON struct {
 	SEID      string   `json:"seid"`
 	UEIP      string   `json:"ue_ip"`
 	TEIDs     []string `json:"teids"`
+	TEIDUL    string   `json:"teid_ul,omitempty"` // Uplink TEID (gNB -> UPF)
+	TEIDDL    string   `json:"teid_dl,omitempty"` // Downlink TEID (UPF -> gNB)
 	CreatedAt string   `json:"created_at"`
 	PacketsUL uint64   `json:"packets_ul"`
 	PacketsDL uint64   `json:"packets_dl"`
@@ -133,7 +138,7 @@ func main() {
 	flag.Parse()
 
 	log.Println("============================================================")
-	log.Println("    CNDI-Final: UPF Data Plane Observability Agent")
+	log.Println("    5G-DPOP: UPF Data Plane Observability Agent")
 	log.Println("============================================================")
 
 	// Check if running as root
@@ -192,7 +197,16 @@ func main() {
 	}
 	defer loader.Close()
 
+	// Store loader globally for API access
+	ebpfLoader = loader
+
 	log.Println("[OK] eBPF programs loaded successfully")
+
+	// NOTE: kfree_skb tracing is DISABLED by default because it captures ALL kernel drops
+	// which creates too much noise. Only gtp5g-specific drops are captured via kprobes.
+	// To enable kernel-wide drop tracing, use: POST /api/config/drop-tracing {"enabled": true}
+	log.Println("[INFO] Kernel-wide drop tracing (kfree_skb) is DISABLED by default")
+	log.Println("[INFO] Only GTP/UPF specific drops will be captured via kprobes")
 
 	// Start PFCP sniffer
 	pfcpSniffer := pfcp.NewSniffer(*pfcpIface, 8805, pfcpCorrelation)
@@ -254,6 +268,9 @@ func startHTTPServer() {
 	// Sync API - sync sessions from free5GC logs
 	http.HandleFunc("/api/sync/sessions", handleSyncSessions)
 
+	// Drop tracing control API
+	http.HandleFunc("/api/config/drop-tracing", handleDropTracingConfig)
+
 	log.Println("[INFO] HTTP server listening on :9100")
 	if err := http.ListenAndServe(":9100", nil); err != nil {
 		log.Printf("HTTP server error: %v", err)
@@ -297,6 +314,16 @@ func handleSessionsAPI(w http.ResponseWriter, r *http.Request) {
 			teids = append(teids, fmt.Sprintf("0x%x", teid))
 		}
 
+		// Extract UL/DL TEIDs (convention: first is UL, second is DL)
+		teidUL := ""
+		teidDL := ""
+		if len(s.TEIDs) >= 1 {
+			teidUL = fmt.Sprintf("0x%x", s.TEIDs[0])
+		}
+		if len(s.TEIDs) >= 2 {
+			teidDL = fmt.Sprintf("0x%x", s.TEIDs[1])
+		}
+
 		ueIP := "N/A"
 		if s.UEIP != nil {
 			ueIP = s.UEIP.String()
@@ -331,6 +358,8 @@ func handleSessionsAPI(w http.ResponseWriter, r *http.Request) {
 			SEID:      fmt.Sprintf("0x%x", s.SEID),
 			UEIP:      ueIP,
 			TEIDs:     teids,
+			TEIDUL:    teidUL,
+			TEIDDL:    teidDL,
 			CreatedAt: s.CreatedAt.Format(time.RFC3339),
 			PacketsUL: s.PacketsUL,
 			PacketsDL: s.PacketsDL,
@@ -370,6 +399,65 @@ func handleSessionsAPI(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(response)
+}
+
+// handleDropTracingConfig handles enabling/disabling kernel drop tracing
+func handleDropTracingConfig(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method == "GET" {
+		// Return current status
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"drop_tracing_enabled": true, // We enable it by default now
+			"message":              "Kernel drop tracing (kfree_skb) is active",
+		})
+		return
+	}
+
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		req.Enabled = true // Default to enable
+	}
+
+	if ebpfLoader == nil {
+		http.Error(w, "eBPF loader not initialized", http.StatusInternalServerError)
+		return
+	}
+
+	if err := ebpfLoader.EnableDropTracing(req.Enabled); err != nil {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":  "error",
+			"message": fmt.Sprintf("Failed to set drop tracing: %v", err),
+		})
+		return
+	}
+
+	state := "disabled"
+	if req.Enabled {
+		state = "enabled"
+	}
+	log.Printf("[CONFIG] Drop tracing %s", state)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"message": fmt.Sprintf("Drop tracing %s", state),
+		"enabled": req.Enabled,
+	})
 }
 
 // formatDuration formats a duration into a human-readable string

@@ -1,4 +1,4 @@
-module github.com/solar224/CNDI-Final
+module github.com/solar224/5G-DPOP
 
 go 1.21
 

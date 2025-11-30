@@ -51,6 +51,8 @@ type DropEvent struct {
 	TEID      string `json:"teid"`
 	SrcIP     string `json:"src_ip"`
 	DstIP     string `json:"dst_ip"`
+	SrcPort   uint16 `json:"src_port"`
+	DstPort   uint16 `json:"dst_port"`
 	Reason    string `json:"reason"`
 	Direction string `json:"direction"`
 	PktLen    uint32 `json:"pkt_len"`
@@ -110,7 +112,7 @@ type Server struct {
 
 func main() {
 	log.Println("============================================================")
-	log.Println("    CNDI-Final: Backend API Server")
+	log.Println("    5G-DPOP: Backend API Server")
 	log.Println("============================================================")
 
 	server := NewServer()

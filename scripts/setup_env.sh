@@ -1,11 +1,11 @@
 #!/bin/bash
-# setup_env.sh - Install development dependencies for CNDI-Final
+# setup_env.sh - Install development dependencies for 5G-DPOP
 # Tested on Ubuntu 25.04 with kernel 6.14
 
 set -e
 
 echo "======================================"
-echo "CNDI-Final Environment Setup"
+echo "5G-DPOP Environment Setup"
 echo "======================================"
 
 # Colors for output

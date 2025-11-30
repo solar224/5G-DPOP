@@ -1,12 +1,12 @@
 #!/bin/bash
 
 echo "============================================"
-echo "  CNDI-Final Complete Test Suite"
+echo "  5G-DPOP Complete Test Suite"
 echo "============================================"
 echo ""
 
 TARGET="192.168.56.103"
-CNDI_DIR="/home/ubuntu25/CNDI-Final"
+CNDI_DIR="/home/ubuntu25/5G-DPOP"
 
 # Check if running as root
 if [ "$EUID" -ne 0 ]; then 

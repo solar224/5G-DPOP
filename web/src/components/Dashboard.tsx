@@ -258,7 +258,7 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                 {/* Drop Alert Panel */}
                 <div className={`${cardBg} rounded-xl p-5 border ${cardBorder}`}>
                     <h2 className={`text-lg font-semibold ${textPrimary} mb-4`}>Drop Events</h2>
-                    <DropAlertPanel drops={drops} theme={theme} />
+                    <DropAlertPanel drops={drops} sessions={sessions} theme={theme} />
                 </div>
 
                 {/* Session Table */}

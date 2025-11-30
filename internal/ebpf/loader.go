@@ -123,6 +123,15 @@ func (l *Loader) Load() error {
 		log.Println("Attached kprobe to gtp5g_encap_recv")
 	}
 
+	// Attach kretprobe to gtp5g_encap_recv for drop detection
+	krpEncapRecv, err := link.Kretprobe("gtp5g_encap_recv", l.objs.KretprobeGtp5gEncapRecv, nil)
+	if err != nil {
+		log.Printf("Warning: failed to attach kretprobe to gtp5g_encap_recv: %v", err)
+	} else {
+		l.links = append(l.links, krpEncapRecv)
+		log.Println("Attached kretprobe to gtp5g_encap_recv")
+	}
+
 	// Attach kprobe to gtp5g_dev_xmit
 	kpDevXmit, err := link.Kprobe("gtp5g_dev_xmit", l.objs.KprobeGtp5gDevXmit, nil)
 	if err != nil {
@@ -130,6 +139,33 @@ func (l *Loader) Load() error {
 	} else {
 		l.links = append(l.links, kpDevXmit)
 		log.Println("Attached kprobe to gtp5g_dev_xmit")
+	}
+
+	// Attach kretprobe to gtp5g_dev_xmit for drop detection
+	krpDevXmit, err := link.Kretprobe("gtp5g_dev_xmit", l.objs.KretprobeGtp5gDevXmit, nil)
+	if err != nil {
+		log.Printf("Warning: failed to attach kretprobe to gtp5g_dev_xmit: %v", err)
+	} else {
+		l.links = append(l.links, krpDevXmit)
+		log.Println("Attached kretprobe to gtp5g_dev_xmit")
+	}
+
+	// Attach kretprobe to pdr_find_by_gtp1u for NO_PDR_MATCH detection (uplink)
+	krpPdrFindGtp1u, err := link.Kretprobe("pdr_find_by_gtp1u", l.objs.KretprobePdrFindByGtp1u, nil)
+	if err != nil {
+		log.Printf("Warning: failed to attach kretprobe to pdr_find_by_gtp1u: %v", err)
+	} else {
+		l.links = append(l.links, krpPdrFindGtp1u)
+		log.Println("Attached kretprobe to pdr_find_by_gtp1u")
+	}
+
+	// Attach kretprobe to pdr_find_by_ipv4 for NO_PDR_MATCH detection (downlink)
+	krpPdrFindIpv4, err := link.Kretprobe("pdr_find_by_ipv4", l.objs.KretprobePdrFindByIpv4, nil)
+	if err != nil {
+		log.Printf("Warning: failed to attach kretprobe to pdr_find_by_ipv4: %v", err)
+	} else {
+		l.links = append(l.links, krpPdrFindIpv4)
+		log.Println("Attached kretprobe to pdr_find_by_ipv4")
 	}
 
 	// Attach tracepoint for kfree_skb

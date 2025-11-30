@@ -145,9 +145,15 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                         <span className={`${textPrimary} font-mono`}>{session.upf_ip || '未知'}</span>
                                     </div>
                                     <div className="flex justify-between">
-                                        <span className={textSecondary}>TEIDs:</span>
-                                        <span className={`${textPrimary} font-mono text-sm`}>
-                                            {session.teids?.join(', ') || 'N/A'}
+                                        <span className={textSecondary}>TEID UL (gNB→UPF):</span>
+                                        <span className={`${textPrimary} font-mono text-sm text-green-400`}>
+                                            {session.teid_ul || session.teids?.[0] || 'N/A'}
+                                        </span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className={textSecondary}>TEID DL (UPF→gNB):</span>
+                                        <span className={`${textPrimary} font-mono text-sm text-blue-400`}>
+                                            {session.teid_dl || session.teids?.[1] || 'N/A'}
                                         </span>
                                     </div>
                                 </div>
@@ -318,9 +324,11 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                 </div>
                                 <div className="bg-purple-600/30 rounded-lg px-6 py-4 text-center border border-purple-500">
                                     <div className="text-purple-300 text-sm mb-1">GTP-U Tunnel</div>
-                                    <div className={`${textPrimary} font-bold text-xl`}>TEIDs: {session.teids?.length || 0} 個</div>
-                                    <div className="text-purple-200 text-sm mt-1">
-                                        {session.teids?.slice(0, 2).join(', ')}{session.teids && session.teids.length > 2 ? '...' : ''}
+                                    <div className={`${textPrimary} font-bold text-lg`}>
+                                        <span className="text-green-400">UL:</span> {session.teid_ul || session.teids?.[0] || 'N/A'}
+                                    </div>
+                                    <div className={`${textPrimary} font-bold text-lg`}>
+                                        <span className="text-blue-400">DL:</span> {session.teid_dl || session.teids?.[1] || 'N/A'}
                                     </div>
                                 </div>
                             </div>
@@ -516,8 +524,8 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                         value={searchTerm}
                         onChange={(e) => setSearchTerm(e.target.value)}
                         className={`w-full rounded-lg pl-10 pr-4 py-2 focus:outline-none focus:ring-2 focus:ring-cyan-500 ${theme === 'dark'
-                                ? 'bg-gray-700 text-white placeholder-gray-400'
-                                : 'bg-gray-100 text-gray-900 placeholder-gray-500 border border-gray-300'
+                            ? 'bg-gray-700 text-white placeholder-gray-400'
+                            : 'bg-gray-100 text-gray-900 placeholder-gray-500 border border-gray-300'
                             }`}
                     />
                     <svg
@@ -590,15 +598,18 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                                 key={`${session.seid}-${index}`}
                                 onClick={() => setSelectedSession(session)}
                                 className={`rounded-xl p-4 cursor-pointer transition-all hover:scale-[1.02] hover:shadow-lg hover:shadow-cyan-500/10 border hover:border-cyan-500/50 ${theme === 'dark'
-                                        ? 'bg-gray-800/80 hover:bg-gray-700/80 border-gray-700'
-                                        : 'bg-white hover:bg-gray-50 border-gray-200'
+                                    ? 'bg-gray-800/80 hover:bg-gray-700/80 border-gray-700'
+                                    : 'bg-white hover:bg-gray-50 border-gray-200'
                                     }`}
                             >
                                 {/* Card Header */}
                                 <div className="flex justify-between items-start mb-3">
                                     <div>
                                         <div className="text-cyan-400 font-bold text-lg">SEID: {session.seid}</div>
-                                        <div className={`text-sm ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>TEIDs: {session.teids?.length || 0} 個</div>
+                                        <div className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
+                                            <span className="text-green-400">UL:</span> {session.teid_ul || session.teids?.[0] || 'N/A'} |
+                                            <span className="text-blue-400"> DL:</span> {session.teid_dl || session.teids?.[1] || 'N/A'}
+                                        </div>
                                     </div>
                                     <div className={`px-2 py-1 rounded-full text-xs ${session.status === 'Active'
                                         ? 'bg-green-500/20 text-green-400'

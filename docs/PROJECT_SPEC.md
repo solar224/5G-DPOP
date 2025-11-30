@@ -1,8 +1,8 @@
-# CNDI-Final: 5G UPF Data Plane Observability Platform
+# 5G-DPOP: 5G UPF Data Plane Observability Platform
 
 > **Version**: 1.0.0  
 > **Date**: 2025-11-29  
-> **Author**: CNDI Team  
+> **Author**: 5G-DPOP Team  
 
 ---
 
@@ -40,7 +40,7 @@
 │  └────────────────────────────────┼────────────────────────────────────────┘ │
 │                                   │                                          │
 │  ┌────────────────────────────────┼────────────────────────────────────────┐ │
-│  │                    CNDI-Final Platform                                   │ │
+│  │                    5G-DPOP Platform                                      │ │
 │  │  ┌──────────────────┐   ┌──────┴───────┐   ┌──────────────────┐        │ │
 │  │  │   PFCP Sniffer   │   │  eBPF Agent  │   │   Backend API    │        │ │
 │  │  │  (Port 8805)     │──►│  (Go/libbpf) │──►│   (Go/Gin)       │        │ │
@@ -204,7 +204,7 @@ struct bpf_map_def SEC("maps") teid_session_map = {
 ## 6. Project Structure
 
 ```
-CNDI-Final/
+5G-DPOP/
 ├── README.md                       # 專案說明、快速開始
 ├── Makefile                        # 統一建置指令
 ├── go.mod                          # Go module definition
@@ -375,7 +375,7 @@ CNDI-Final/
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│  CNDI-Final: UPF Data Plane Observability                    [Status: OK]   │
+│  5G-DPOP: UPF Data Plane Observability                       [Status: OK]   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─── Traffic Overview ─────────────────────────────────────────────────┐   │

@@ -150,6 +150,29 @@ struct
     __type(value, __u32);
 } agent_config SEC(".maps");
 
+// Pending packet info - for passing data from kprobe to kretprobe
+// Keyed by task PID to support concurrent packets
+struct pending_pkt_info
+{
+    __u32 teid;
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 src_port;
+    __u16 dst_port;
+    __u32 pkt_len;
+    __u8 direction;
+    __u8 valid;
+    __u8 pad[2];
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32); // PID/TID
+    __type(value, struct pending_pkt_info);
+} pending_pkts SEC(".maps");
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -214,6 +237,7 @@ static __always_inline void update_ue_ip_counter(__u32 ue_ip, __u32 len)
 }
 
 static __always_inline void emit_drop_event(__u32 teid, __u32 src_ip, __u32 dst_ip,
+                                            __u16 src_port, __u16 dst_port,
                                             __u32 pkt_len, __u8 reason, __u8 direction)
 {
     struct drop_event *event;
@@ -231,8 +255,8 @@ static __always_inline void emit_drop_event(__u32 teid, __u32 src_ip, __u32 dst_
     event->pkt_len = pkt_len;
     event->reason = reason;
     event->direction = direction;
-    event->src_port = 0;
-    event->dst_port = 0;
+    event->src_port = src_port;
+    event->dst_port = dst_port;
 
     bpf_ringbuf_submit(event, 0);
 }
@@ -278,8 +302,13 @@ int BPF_KPROBE(kprobe_gtp5g_encap_recv, struct sock *sk, struct sk_buff *skb)
 {
     __u32 len;
     __u32 teid = 0;
+    __u32 src_ip = 0, dst_ip = 0;
+    __u16 src_port = 0, dst_port = 0;
     unsigned char *head;
     __u16 transport_header;
+    __u16 network_header;
+    __u32 pid;
+    struct pending_pkt_info pkt_info = {0};
 
     if (!skb)
     {
@@ -297,6 +326,7 @@ int BPF_KPROBE(kprobe_gtp5g_encap_recv, struct sock *sk, struct sk_buff *skb)
     // TEID is at offset 4 from the start of GTP header
     head = BPF_CORE_READ(skb, head);
     transport_header = BPF_CORE_READ(skb, transport_header);
+    network_header = BPF_CORE_READ(skb, network_header);
 
     if (head && transport_header > 0)
     {
@@ -306,15 +336,41 @@ int BPF_KPROBE(kprobe_gtp5g_encap_recv, struct sock *sk, struct sk_buff *skb)
         bpf_probe_read_kernel(&teid, sizeof(teid), gtp_header + 4);
         teid = bpf_ntohl(teid);
 
+        // Read outer IP header for src/dst
+        if (network_header > 0)
+        {
+            unsigned char *ip_header = head + network_header;
+            bpf_probe_read_kernel(&src_ip, sizeof(src_ip), ip_header + 12);
+            bpf_probe_read_kernel(&dst_ip, sizeof(dst_ip), ip_header + 16);
+        }
+
+        // Read UDP ports
+        unsigned char *udp_header = head + transport_header;
+        bpf_probe_read_kernel(&src_port, sizeof(src_port), udp_header);
+        bpf_probe_read_kernel(&dst_port, sizeof(dst_port), udp_header + 2);
+        src_port = bpf_ntohs(src_port);
+        dst_port = bpf_ntohs(dst_port);
+
         if (teid > 0)
         {
             update_teid_counter(teid, len);
 
             // Emit packet event for detailed tracking
-            __u32 src_ip = 0, dst_ip = 0;
             emit_packet_event(teid, src_ip, dst_ip, len, DIRECTION_UPLINK, 0);
         }
     }
+
+    // Save packet info for kretprobe
+    pid = bpf_get_current_pid_tgid() >> 32;
+    pkt_info.teid = teid;
+    pkt_info.src_ip = src_ip;
+    pkt_info.dst_ip = dst_ip;
+    pkt_info.src_port = src_port;
+    pkt_info.dst_port = dst_port;
+    pkt_info.pkt_len = len;
+    pkt_info.direction = DIRECTION_UPLINK;
+    pkt_info.valid = 1;
+    bpf_map_update_elem(&pending_pkts, &pid, &pkt_info, BPF_ANY);
 
     return 0;
 }
@@ -326,8 +382,11 @@ int BPF_KPROBE(kprobe_gtp5g_dev_xmit, struct sk_buff *skb, struct net_device *de
 {
     __u32 len;
     __u32 teid = 0;
+    __u32 src_ip = 0, dst_ip = 0;
     unsigned char *data;
     __u32 data_len;
+    __u32 pid;
+    struct pending_pkt_info pkt_info = {0};
 
     if (!skb)
     {
@@ -348,17 +407,29 @@ int BPF_KPROBE(kprobe_gtp5g_dev_xmit, struct sk_buff *skb, struct net_device *de
 
     if (data && data_len >= 20)
     {
-        // Read inner IP header to get destination (UE IP)
-        __u32 dst_ip = 0;
+        // Read inner IP header to get source and destination (UE IP)
+        bpf_probe_read_kernel(&src_ip, sizeof(src_ip), data + 12); // IP src at offset 12
         bpf_probe_read_kernel(&dst_ip, sizeof(dst_ip), data + 16); // IP dst at offset 16
 
         // Update per-UE IP counter for downlink traffic
         if (dst_ip > 0)
         {
             update_ue_ip_counter(dst_ip, len);
-            emit_packet_event(0, 0, dst_ip, len, DIRECTION_DOWNLINK, 0);
+            emit_packet_event(0, src_ip, dst_ip, len, DIRECTION_DOWNLINK, 0);
         }
     }
+
+    // Save packet info for kretprobe
+    pid = bpf_get_current_pid_tgid() >> 32;
+    pkt_info.teid = teid;
+    pkt_info.src_ip = src_ip;
+    pkt_info.dst_ip = dst_ip;
+    pkt_info.src_port = 0;
+    pkt_info.dst_port = 0;
+    pkt_info.pkt_len = len;
+    pkt_info.direction = DIRECTION_DOWNLINK;
+    pkt_info.valid = 1;
+    bpf_map_update_elem(&pending_pkts, &pid, &pkt_info, BPF_ANY);
 
     return 0;
 }
@@ -372,11 +443,78 @@ int BPF_KPROBE(kprobe_gtp5g_handle_skb, struct sk_buff *skb)
     return 0;
 }
 
+// Hook: kretprobe for pdr_find_by_gtp1u - Detect PDR lookup failures
+// Returns NULL when no matching PDR is found (NO_PDR_MATCH drop)
+SEC("kretprobe/pdr_find_by_gtp1u")
+int BPF_KRETPROBE(kretprobe_pdr_find_by_gtp1u, void *ret)
+{
+    __u32 pid;
+    struct pending_pkt_info *pkt_info;
+
+    // If return value is NULL, PDR lookup failed
+    if (ret == NULL)
+    {
+        // Get packet info saved by kprobe_gtp5g_encap_recv
+        pid = bpf_get_current_pid_tgid() >> 32;
+        pkt_info = bpf_map_lookup_elem(&pending_pkts, &pid);
+
+        if (pkt_info && pkt_info->valid)
+        {
+            emit_drop_event(pkt_info->teid, pkt_info->src_ip, pkt_info->dst_ip,
+                            pkt_info->src_port, pkt_info->dst_port,
+                            pkt_info->pkt_len, DROP_REASON_NO_PDR, DIRECTION_UPLINK);
+            // Mark as processed to avoid double counting
+            pkt_info->valid = 0;
+            bpf_map_update_elem(&pending_pkts, &pid, pkt_info, BPF_ANY);
+        }
+        else
+        {
+            emit_drop_event(0, 0, 0, 0, 0, 0, DROP_REASON_NO_PDR, DIRECTION_UPLINK);
+        }
+    }
+    return 0;
+}
+
+// Hook: kretprobe for pdr_find_by_ipv4 - Detect PDR lookup failures (downlink)
+// Returns NULL when no matching PDR is found (NO_PDR_MATCH drop)
+SEC("kretprobe/pdr_find_by_ipv4")
+int BPF_KRETPROBE(kretprobe_pdr_find_by_ipv4, void *ret)
+{
+    __u32 pid;
+    struct pending_pkt_info *pkt_info;
+
+    // If return value is NULL, PDR lookup failed
+    if (ret == NULL)
+    {
+        // Get packet info saved by kprobe_gtp5g_dev_xmit
+        pid = bpf_get_current_pid_tgid() >> 32;
+        pkt_info = bpf_map_lookup_elem(&pending_pkts, &pid);
+
+        if (pkt_info && pkt_info->valid)
+        {
+            emit_drop_event(pkt_info->teid, pkt_info->src_ip, pkt_info->dst_ip,
+                            pkt_info->src_port, pkt_info->dst_port,
+                            pkt_info->pkt_len, DROP_REASON_NO_PDR, DIRECTION_DOWNLINK);
+            // Mark as processed to avoid double counting
+            pkt_info->valid = 0;
+            bpf_map_update_elem(&pending_pkts, &pid, pkt_info, BPF_ANY);
+        }
+        else
+        {
+            emit_drop_event(0, 0, 0, 0, 0, 0, DROP_REASON_NO_PDR, DIRECTION_DOWNLINK);
+        }
+    }
+    return 0;
+}
+
 // Hook: kretprobe for gtp5g_encap_recv - Detect uplink drops
 // Returns < 0 indicate packet was dropped
 SEC("kretprobe/gtp5g_encap_recv")
 int BPF_KRETPROBE(kretprobe_gtp5g_encap_recv, int ret)
 {
+    __u32 pid;
+    struct pending_pkt_info *pkt_info;
+
     if (ret < 0)
     {
         // Packet was dropped during uplink processing
@@ -396,7 +534,28 @@ int BPF_KRETPROBE(kretprobe_gtp5g_encap_recv, int ret)
             reason = DROP_REASON_MEMORY;
         }
 
-        emit_drop_event(0, 0, 0, 0, reason, DIRECTION_UPLINK);
+        // Get packet info saved by kprobe
+        pid = bpf_get_current_pid_tgid() >> 32;
+        pkt_info = bpf_map_lookup_elem(&pending_pkts, &pid);
+
+        if (pkt_info && pkt_info->valid)
+        {
+            emit_drop_event(pkt_info->teid, pkt_info->src_ip, pkt_info->dst_ip,
+                            pkt_info->src_port, pkt_info->dst_port,
+                            pkt_info->pkt_len, reason, DIRECTION_UPLINK);
+            // Clean up
+            bpf_map_delete_elem(&pending_pkts, &pid);
+        }
+        else
+        {
+            emit_drop_event(0, 0, 0, 0, 0, 0, reason, DIRECTION_UPLINK);
+        }
+    }
+    else
+    {
+        // Success - clean up pending entry
+        pid = bpf_get_current_pid_tgid() >> 32;
+        bpf_map_delete_elem(&pending_pkts, &pid);
     }
     return 0;
 }
@@ -405,12 +564,36 @@ int BPF_KRETPROBE(kretprobe_gtp5g_encap_recv, int ret)
 SEC("kretprobe/gtp5g_dev_xmit")
 int BPF_KRETPROBE(kretprobe_gtp5g_dev_xmit, int ret)
 {
+    __u32 pid;
+    struct pending_pkt_info *pkt_info;
+
     if (ret != 0) // NETDEV_TX_OK = 0
     {
         // Packet was dropped during downlink processing
         __u8 reason = DROP_REASON_ENCAP_FAIL;
 
-        emit_drop_event(0, 0, 0, 0, reason, DIRECTION_DOWNLINK);
+        // Get packet info saved by kprobe
+        pid = bpf_get_current_pid_tgid() >> 32;
+        pkt_info = bpf_map_lookup_elem(&pending_pkts, &pid);
+
+        if (pkt_info && pkt_info->valid)
+        {
+            emit_drop_event(pkt_info->teid, pkt_info->src_ip, pkt_info->dst_ip,
+                            pkt_info->src_port, pkt_info->dst_port,
+                            pkt_info->pkt_len, reason, DIRECTION_DOWNLINK);
+            // Clean up
+            bpf_map_delete_elem(&pending_pkts, &pid);
+        }
+        else
+        {
+            emit_drop_event(0, 0, 0, 0, 0, 0, reason, DIRECTION_DOWNLINK);
+        }
+    }
+    else
+    {
+        // Success - clean up pending entry
+        pid = bpf_get_current_pid_tgid() >> 32;
+        bpf_map_delete_elem(&pending_pkts, &pid);
     }
     return 0;
 }
@@ -457,7 +640,7 @@ int tracepoint_kfree_skb(struct trace_event_raw_kfree_skb *ctx)
 // ctx->reason available in newer kernels
 #endif
 
-    emit_drop_event(0, 0, 0, len, reason, 0);
+    emit_drop_event(0, 0, 0, 0, 0, len, reason, 0);
 
     return 0;
 }
@@ -500,7 +683,7 @@ int BPF_KRETPROBE(kretprobe_ip_forward, int ret)
 
     if (ret != 0)
     {
-        emit_drop_event(0, 0, 0, 0, DROP_REASON_ROUTING, 0);
+        emit_drop_event(0, 0, 0, 0, 0, 0, DROP_REASON_ROUTING, 0);
     }
     return 0;
 }
