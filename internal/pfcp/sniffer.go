@@ -102,73 +102,107 @@ type Correlation struct {
 	teidMap     map[uint32]uint64   // TEID -> SEID
 	ueIPMap     map[string]uint64   // UE IP string -> primary SEID (for deduplication)
 	seidCounter uint64              // Counter for generating unique SEIDs
+	// Track session creation timestamps to handle race conditions
+	sessionCreationTime map[string]time.Time // UE IP -> creation time
 }
 
 // NewCorrelation creates a new correlation store
 func NewCorrelation() *Correlation {
 	return &Correlation{
-		sessions:    make(map[uint64]*Session),
-		teidMap:     make(map[uint32]uint64),
-		ueIPMap:     make(map[string]uint64),
-		seidCounter: 0,
+		sessions:            make(map[uint64]*Session),
+		teidMap:             make(map[uint32]uint64),
+		ueIPMap:             make(map[string]uint64),
+		seidCounter:         0,
+		sessionCreationTime: make(map[string]time.Time),
 	}
 }
 
 // getNextSEID generates a sequential SEID for new sessions
+// Uses atomic-like pattern with mutex already held by caller
 func (c *Correlation) getNextSEID() uint64 {
 	c.seidCounter++
 	return c.seidCounter
 }
 
 // AddSession adds or updates a session
-// Uses UE IP as the primary deduplication key to handle SMF/UPF SEID differences
+// Each unique UE IP should have exactly one session entry
+// This function is thread-safe and handles concurrent session creation
 func (c *Correlation) AddSession(session *Session) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If session has UE IP, check for existing session with same UE IP
-	if session.UEIP != nil {
-		ueIPStr := session.UEIP.String()
-		if existingSEID, exists := c.ueIPMap[ueIPStr]; exists {
-			// Merge with existing session instead of creating a new one
-			if existingSession, ok := c.sessions[existingSEID]; ok {
-				// Merge TEIDs (avoid duplicates)
-				teidSet := make(map[uint32]bool)
-				for _, t := range existingSession.TEIDs {
-					teidSet[t] = true
-				}
-				for _, t := range session.TEIDs {
-					if !teidSet[t] && t != 0 {
-						existingSession.TEIDs = append(existingSession.TEIDs, t)
-						c.teidMap[t] = existingSEID
-					}
-				}
-				// Update other fields if they have better data
-				if session.DNN != "" && existingSession.DNN == "" {
-					existingSession.DNN = session.DNN
-				}
-				if session.QFI != 0 && existingSession.QFI == 0 {
-					existingSession.QFI = session.QFI
-				}
-				if session.UPFIP != nil && existingSession.UPFIP == nil {
-					existingSession.UPFIP = session.UPFIP
-				}
-				if session.GNBIP != nil && existingSession.GNBIP == nil {
-					existingSession.GNBIP = session.GNBIP
-				}
-				if session.MBRUplink > 0 {
-					existingSession.MBRUplink = session.MBRUplink
-				}
-				if session.MBRDownlink > 0 {
-					existingSession.MBRDownlink = session.MBRDownlink
-				}
-				existingSession.LastActive = time.Now()
+	// If session has no UE IP, we cannot properly deduplicate - skip it
+	if session.UEIP == nil {
+		log.Printf("[WARN] AddSession: session without UE IP, skipping (SEID=0x%x)", session.SEID)
+		return
+	}
+
+	ueIPStr := session.UEIP.String()
+
+	// Check if we already have a session for this UE IP
+	if existingSEID, exists := c.ueIPMap[ueIPStr]; exists {
+		if existingSession, ok := c.sessions[existingSEID]; ok {
+			// Only merge if this is clearly an update (same session being modified)
+			// Don't merge if the existing session was just created (within 100ms)
+			// This prevents race conditions during rapid session establishment
+			creationTime, hasTime := c.sessionCreationTime[ueIPStr]
+			timeSinceCreation := time.Since(creationTime)
+
+			if hasTime && timeSinceCreation < 100*time.Millisecond {
+				// Recent session - likely a race condition, skip this update
+				log.Printf("[DEBUG] AddSession: Skipping duplicate for UE IP %s (created %v ago)",
+					ueIPStr, timeSinceCreation)
 				return
 			}
+
+			// Merge with existing session
+			log.Printf("[DEBUG] AddSession: Merging session for UE IP %s (existing SEID=0x%x)",
+				ueIPStr, existingSEID)
+
+			// Merge TEIDs (avoid duplicates)
+			teidSet := make(map[uint32]bool)
+			for _, t := range existingSession.TEIDs {
+				teidSet[t] = true
+			}
+			for _, t := range session.TEIDs {
+				if !teidSet[t] && t != 0 {
+					existingSession.TEIDs = append(existingSession.TEIDs, t)
+					c.teidMap[t] = existingSEID
+				}
+			}
+			// Update other fields if they have better data
+			if session.DNN != "" && existingSession.DNN == "" {
+				existingSession.DNN = session.DNN
+			}
+			if session.QFI != 0 && existingSession.QFI == 0 {
+				existingSession.QFI = session.QFI
+			}
+			if session.UPFIP != nil && existingSession.UPFIP == nil {
+				existingSession.UPFIP = session.UPFIP
+			}
+			if session.GNBIP != nil && existingSession.GNBIP == nil {
+				existingSession.GNBIP = session.GNBIP
+			}
+			if session.MBRUplink > 0 {
+				existingSession.MBRUplink = session.MBRUplink
+			}
+			if session.MBRDownlink > 0 {
+				existingSession.MBRDownlink = session.MBRDownlink
+			}
+			existingSession.LastActive = time.Now()
+			return
 		}
-		// New session with this UE IP
-		c.ueIPMap[ueIPStr] = session.SEID
 	}
+
+	// New session with this UE IP
+	// Assign a new sequential SEID if not already set
+	if session.SEID == 0 {
+		session.SEID = c.getNextSEID()
+	}
+
+	// Register this UE IP -> SEID mapping
+	c.ueIPMap[ueIPStr] = session.SEID
+	c.sessionCreationTime[ueIPStr] = time.Now()
 
 	// Store session
 	c.sessions[session.SEID] = session
@@ -177,6 +211,9 @@ func (c *Correlation) AddSession(session *Session) {
 			c.teidMap[teid] = session.SEID
 		}
 	}
+
+	log.Printf("[DEBUG] AddSession: New session SEID=0x%x for UE IP %s (total sessions: %d)",
+		session.SEID, ueIPStr, len(c.sessions))
 }
 
 // RemoveSession removes a session
@@ -188,11 +225,14 @@ func (c *Correlation) RemoveSession(seid uint64) {
 		for _, teid := range session.TEIDs {
 			delete(c.teidMap, teid)
 		}
-		// Remove from UE IP map
+		// Remove from UE IP map and creation time tracking
 		if session.UEIP != nil {
-			delete(c.ueIPMap, session.UEIP.String())
+			ueIPStr := session.UEIP.String()
+			delete(c.ueIPMap, ueIPStr)
+			delete(c.sessionCreationTime, ueIPStr)
 		}
 		delete(c.sessions, seid)
+		log.Printf("[DEBUG] RemoveSession: Removed SEID=0x%x (total sessions: %d)", seid, len(c.sessions))
 	}
 }
 
@@ -325,11 +365,16 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 		return
 	}
 
-	// Parse PFCP header
+	// Parse PFCP header (3GPP TS 29.244)
+	// Byte 0: Version (3 bits) + Spare (3 bits) + MP (1 bit) + S (1 bit)
+	// Byte 1: Message Type
+	// Bytes 2-3: Message Length (excludes first 4 bytes of header)
+	// If S=1: Bytes 4-11: SEID, then Bytes 12-15: Sequence Number + Spare
+	// If S=0: Bytes 4-7: Sequence Number + Spare
 	msgType := payload[1]
 	msgLen := binary.BigEndian.Uint16(payload[2:4])
 
-	// Check if it's a session message (has SEID)
+	// Check if it's a session message (has SEID) - S bit is bit 0
 	hasSessionID := (payload[0] & 0x01) != 0
 
 	var seid uint64
@@ -340,25 +385,42 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 			return
 		}
 		seid = binary.BigEndian.Uint64(payload[4:12])
-		ieOffset = 16
+		ieOffset = 16 // Header (4) + SEID (8) + SeqNum (4) = 16
 	} else {
-		ieOffset = 8
+		ieOffset = 8 // Header (4) + SeqNum (4) = 8
 	}
+
+	// Calculate IE data end position
+	// msgLen is the length of everything after the first 4 bytes
+	// So total packet should be: 4 + msgLen
+	ieDataEnd := 4 + int(msgLen)
+	if ieDataEnd > len(payload) {
+		log.Printf("[PFCP-WARN] Message length (%d) exceeds payload (%d), truncating", ieDataEnd, len(payload))
+		ieDataEnd = len(payload)
+	}
+
+	// Ensure we have IE data to process
+	if ieOffset >= ieDataEnd {
+		log.Printf("[PFCP-WARN] No IE data in message (offset=%d, end=%d)", ieOffset, ieDataEnd)
+		return
+	}
+
+	ieData := payload[ieOffset:ieDataEnd]
 
 	// Process based on message type
 	// Only create sessions from Establishment Request (has complete data)
 	// Response and Modification only update existing sessions
 	switch msgType {
 	case MsgTypeSessionEstablishmentRequest:
-		log.Printf("[PFCP-DEBUG] Session Establishment Request: SEID=0x%x, msgLen=%d", seid, msgLen)
-		s.handleSessionEstablishmentRequest(payload[ieOffset : int(msgLen)+4])
+		log.Printf("[PFCP-DEBUG] Session Establishment Request: SEID=0x%x, msgLen=%d, ieDataLen=%d", seid, msgLen, len(ieData))
+		s.handleSessionEstablishmentRequest(ieData)
 	case MsgTypeSessionEstablishmentResponse:
 		// Response contains the UPF-assigned SEID, but limited data
 		// We'll update existing session if we can match by F-TEID
 		log.Printf("[PFCP-DEBUG] Session Establishment Response: SEID=0x%x (ignored - use Request data)", seid)
 	case MsgTypeSessionModificationRequest:
 		log.Printf("[PFCP-DEBUG] Session Modification Request: SEID=0x%x", seid)
-		s.handleSessionModification(seid, payload[ieOffset:int(msgLen)+4])
+		s.handleSessionModification(seid, ieData)
 	case MsgTypeSessionModificationResponse:
 		log.Printf("[PFCP-DEBUG] Session Modification Response: SEID=0x%x (ignored)", seid)
 	case MsgTypeSessionDeletionRequest:
@@ -375,92 +437,81 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 // handleSessionEstablishmentRequest handles Session Establishment Request
 // This is the only place where new sessions are created (Request has all the data)
 func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte) {
-	// First, extract UE IP - this is our primary key for deduplication
+	// First, extract UE IP - this is our primary key for session identification
 	ueIP := s.extractUEIP(ieData)
 	if ueIP == nil {
-		log.Printf("PFCP Session Establishment: No UE IP found, skipping")
+		log.Printf("[PFCP] Session Establishment: No UE IP found in IEs, skipping")
 		return
 	}
 
 	ueIPStr := ueIP.String()
-	log.Printf("PFCP Session Establishment Request: UE_IP=%s", ueIPStr)
+	log.Printf("[PFCP] Session Establishment Request: UE_IP=%s", ueIPStr)
 
-	// Check if we already have a session for this UE IP
-	if existingSession, exists := s.correlation.GetSessionByUEIP(ueIPStr); exists {
-		log.Printf("   └─ Session for UE IP %s already exists (SEID=0x%x), updating", ueIPStr, existingSession.SEID)
-		// Update existing session with new data
-		s.extractSessionInfo(ieData, existingSession)
-		// Extract TEIDs and add only unique ones
-		newTEIDs := s.extractUniqueTEIDs(ieData, existingSession.TEIDs)
-		existingSession.TEIDs = newTEIDs
-		s.extractFTEIDDetails(ieData, existingSession)
-		existingSession.LastActive = time.Now()
-		s.correlation.AddSession(existingSession)
-		log.Printf("   └─ Updated TEIDs: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
-			existingSession.TEIDs, existingSession.DNN, existingSession.QFI,
-			existingSession.MBRUplink, existingSession.MBRDownlink)
-		return
+	// Extract TEIDs first - we need these to properly identify the session
+	teids := s.extractUniqueTEIDs(ieData, nil)
+	if len(teids) == 0 {
+		log.Printf("   └─ Warning: No TEIDs found for UE IP %s", ueIPStr)
 	}
 
-	// Create new session with sequential SEID (matching free5gc's allocation pattern)
-	newSEID := s.correlation.getNextSEID()
-
+	// Create new session - always create a new entry for each unique UE IP
+	// The AddSession function will handle deduplication properly
 	session := &Session{
-		SEID:       newSEID,
+		SEID:       0, // Will be assigned by AddSession
 		UEIP:       ueIP,
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
-		TEIDs:      make([]uint32, 0),
+		TEIDs:      teids,
 		Status:     "Active",
 	}
 
 	// Parse IEs to extract all available info
 	s.extractSessionInfo(ieData, session)
 
-	// Extract unique TEIDs (filter out zeros and duplicates)
-	session.TEIDs = s.extractUniqueTEIDs(ieData, nil)
-
 	// Extract F-TEID details (UPF/gNB IPs)
 	s.extractFTEIDDetails(ieData, session)
 
+	// Add session (will handle deduplication and SEID assignment)
 	s.correlation.AddSession(session)
 
-	log.Printf("   └─ New session SEID=0x%x: TEIDs: %v, UE_IP: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
-		newSEID, session.TEIDs, ueIP, session.DNN, session.QFI, session.MBRUplink, session.MBRDownlink)
+	log.Printf("   └─ Session created: TEIDs: %v, UE_IP: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
+		session.TEIDs, ueIP, session.DNN, session.QFI, session.MBRUplink, session.MBRDownlink)
 }
 
 func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte) {
-	log.Printf("PFCP Session Modification: SEID=0x%x", seid)
+	log.Printf("[PFCP] Session Modification: SEID=0x%x", seid)
 
-	// First try to find session by SEID
-	session, ok := s.correlation.GetSessionBySEID(seid)
+	// First try to find session by UE IP (our primary key)
+	ueIP := s.extractUEIP(ieData)
+	var session *Session
+	var ok bool
 
-	// If not found by SEID, try to find by UE IP (since we use UE IP as primary key)
+	if ueIP != nil {
+		session, ok = s.correlation.GetSessionByUEIP(ueIP.String())
+		if ok {
+			log.Printf("   └─ Found session by UE IP %s (SEID=0x%x)", ueIP.String(), session.SEID)
+		}
+	}
+
+	// If not found by UE IP, try by SEID (fallback)
 	if !ok {
-		ueIP := s.extractUEIP(ieData)
-		if ueIP != nil {
-			session, ok = s.correlation.GetSessionByUEIP(ueIP.String())
-			if ok {
-				log.Printf("   └─ Found session by UE IP %s (SEID=0x%x)", ueIP.String(), session.SEID)
-			}
+		session, ok = s.correlation.GetSessionBySEID(seid)
+		if ok {
+			log.Printf("   └─ Found session by SEID 0x%x", seid)
 		}
 	}
 
 	if !ok {
 		// Session not found - only create if we have UE IP
-		ueIP := s.extractUEIP(ieData)
 		if ueIP == nil {
-			log.Printf("   └─ Session 0x%x not found and no UE IP, skipping", seid)
+			log.Printf("   └─ Session not found and no UE IP, skipping modification")
 			return
 		}
 
-		log.Printf("   └─ Session 0x%x not found, creating from modification data with UE IP %s", seid, ueIP.String())
+		log.Printf("   └─ Session not found, creating from modification data with UE IP %s", ueIP.String())
 
-		// Create new session with sequential SEID
-		newSEID := s.correlation.getNextSEID()
-
+		// Create new session - SEID will be assigned by AddSession
 		session = &Session{
-			SEID:       newSEID,
+			SEID:       0, // Will be assigned by AddSession
 			UEIP:       ueIP,
 			CreatedAt:  time.Now(),
 			LastActive: time.Now(),
@@ -476,11 +527,8 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte) {
 	session.TEIDs = s.extractUniqueTEIDs(ieData, session.TEIDs)
 
 	// Extract UE IP if present and not already set
-	if session.UEIP == nil {
-		ueIP := s.extractUEIP(ieData)
-		if ueIP != nil {
-			session.UEIP = ueIP
-		}
+	if session.UEIP == nil && ueIP != nil {
+		session.UEIP = ueIP
 	}
 
 	// Extract gNB IP from Modification (this is where gNB endpoint info appears)
@@ -734,24 +782,51 @@ func (s *Sniffer) extractUniqueTEIDs(ieData []byte, existingTEIDs []uint32) []ui
 }
 
 // extractUEIP extracts UE IP Address from PFCP IEs (including nested IEs)
+// According to 3GPP TS 29.244, UE IP Address IE (Type 93) format:
+// - Flags (1 byte): bit 0=S/D, bit 1=V4, bit 2=V6, bit 3=IPv6D, bit 4=CHV4, bit 5=CHV6
+// - IPv4 address (4 bytes) if V4 bit is set and CHV4 is not set
+// - IPv6 address (16 bytes) if V6 bit is set and CHV6 is not set
 func (s *Sniffer) extractUEIP(ieData []byte) net.IP {
 	var ueIP net.IP
+	var foundCount int
+
 	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
 		// UE IP Address IE (Type 93)
 		if ieType == IETypeUEIPAddr && len(ieValue) >= 1 {
 			flags := ieValue[0]
 			offset := 1
-			// Check for IPv4 (bit 1)
-			if flags&0x02 != 0 && len(ieValue) >= offset+4 {
-				ueIP = net.IP(ieValue[offset : offset+4])
-				log.Printf("   └─ Found UE IP: %s", ueIP)
+
+			// Check V4 bit (bit 1) and ensure CHV4 (bit 4) is not set
+			// CHV4 means "Choose IPv4 Address" - the IP hasn't been assigned yet
+			hasV4 := (flags & 0x02) != 0
+			isChooseV4 := (flags & 0x10) != 0
+
+			if hasV4 && !isChooseV4 && len(ieValue) >= offset+4 {
+				extractedIP := net.IP(make([]byte, 4))
+				copy(extractedIP, ieValue[offset:offset+4])
+
+				// Validate that it's a proper UE IP (not 0.0.0.0)
+				if !extractedIP.Equal(net.IPv4zero) {
+					// Only use the first valid UE IP found (avoid overwriting)
+					if ueIP == nil {
+						ueIP = extractedIP
+						foundCount++
+						log.Printf("   └─ Found UE IP: %s (flags=0x%02x)", ueIP, flags)
+					} else if !ueIP.Equal(extractedIP) {
+						// Log if we find a different UE IP (shouldn't happen in same session)
+						log.Printf("   └─ Additional UE IP found (ignored): %s", extractedIP)
+					}
+				}
+			} else if isChooseV4 {
+				log.Printf("   └─ UE IP Address IE with CHV4 flag (IP not yet assigned)")
 			}
 		}
-		// Source Interface IE often contains IP info in PDI
-		if ieType == 20 && len(ieValue) >= 1 { // Source Interface
-			log.Printf("   └─ Source Interface: %d", ieValue[0])
-		}
 	})
+
+	if ueIP == nil {
+		log.Printf("   └─ No valid UE IP found in PFCP message")
+	}
+
 	return ueIP
 }
 
