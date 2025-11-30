@@ -29,12 +29,42 @@ export interface DropEvent {
 }
 
 export interface SessionInfo {
-    seid: string
+    // 基本識別 (後端回傳字串格式)
+    seid: string           // "0x1234" 格式
     ue_ip: string
-    teids: string[]
-    created_at: string
+    teids: string[]        // ["0x1a", "0x1b"] 格式
+    created_at: string     // RFC3339 格式 "2025-11-29T16:22:12Z"
+
+    // 封包統計
     packets_ul: number
     packets_dl: number
+    bytes_ul: number
+    bytes_dl: number
+
+    // 5G 識別資訊
+    supi?: string          // "imsi-208930000000001"
+    dnn?: string           // "internet"
+    s_nssai?: string       // "SST:1, SD:010203"
+    qfi?: number           // QoS Flow ID
+    session_type?: string  // "IPv4"
+    pdu_session_id?: number
+
+    // 網路節點 IP
+    upf_ip?: string
+    gnb_ip?: string
+
+    // QoS 參數
+    qos_5qi?: number       // 5QI 值
+    arp_priority?: number
+    gbr_ul_kbps?: number
+    gbr_dl_kbps?: number
+    mbr_ul_kbps?: number
+    mbr_dl_kbps?: number
+
+    // 狀態
+    status: string
+    duration?: string
+    last_active?: string
 }
 
 // API Functions
@@ -80,6 +110,7 @@ export function createMetricsWebSocket(
     onClose: () => void
 ): WebSocket {
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    // Use the same host - vite proxy will handle forwarding to API server
     const ws = new WebSocket(`${protocol}//${window.location.host}/ws/metrics`)
 
     ws.onmessage = (event) => {

@@ -15,6 +15,7 @@ UERANSIM
 free5gc 更新到v4.1.0
 ueransim 啟動成功，free5gc 啟動成功
 確認ueransim 能夠通過 free5gc ping 到外網
+目前能夠看到Uplink Traffic、Downlink Traffic、Live Traffic
 )
 以下是我目前的想法，請問你能提供詳細的實作分配及流程還有專案架構給我嗎?
 觀測平台我希望能夠改成自己建一個前端網頁，用來顯示。

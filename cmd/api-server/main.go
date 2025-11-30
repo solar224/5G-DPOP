@@ -1,13 +1,26 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+)
+
+const (
+	// Agent endpoints
+	agentMetricsURL  = "http://localhost:9100/metrics"
+	agentDropsURL    = "http://localhost:9100/api/drops"
+	agentSessionsURL = "http://localhost:9100/api/sessions"
 )
 
 // TrafficStats represents traffic statistics
@@ -26,10 +39,10 @@ type DirectionStats struct {
 
 // DropStats represents drop statistics
 type DropStats struct {
-	Total        uint64       `json:"total"`
-	Rate         float64      `json:"rate_percent"`
-	RecentDrops  []DropEvent  `json:"recent_drops"`
-	ByReason     map[string]uint64 `json:"by_reason"`
+	Total       uint64            `json:"total"`
+	Rate        float64           `json:"rate_percent"`
+	RecentDrops []DropEvent       `json:"recent_drops"`
+	ByReason    map[string]uint64 `json:"by_reason"`
 }
 
 // DropEvent represents a single drop event
@@ -43,29 +56,56 @@ type DropEvent struct {
 	PktLen    uint32 `json:"pkt_len"`
 }
 
-// SessionInfo represents a PDU session
+// SessionInfo represents a PDU session (extended)
 type SessionInfo struct {
-	SEID       string   `json:"seid"`
-	UEIP       string   `json:"ue_ip"`
-	TEIDs      []string `json:"teids"`
-	CreatedAt  string   `json:"created_at"`
-	PacketsUL  uint64   `json:"packets_ul"`
-	PacketsDL  uint64   `json:"packets_dl"`
+	SEID      string   `json:"seid"`
+	UEIP      string   `json:"ue_ip"`
+	TEIDs     []string `json:"teids"`
+	CreatedAt string   `json:"created_at"`
+	PacketsUL uint64   `json:"packets_ul"`
+	PacketsDL uint64   `json:"packets_dl"`
+
+	// Extended fields
+	UPFIP       string `json:"upf_ip,omitempty"`
+	GNBIP       string `json:"gnb_ip,omitempty"`
+	SUPI        string `json:"supi,omitempty"`
+	DNN         string `json:"dnn,omitempty"`
+	SNssai      string `json:"s_nssai,omitempty"`
+	QFI         uint8  `json:"qfi,omitempty"`
+	SessionType string `json:"session_type,omitempty"`
+	SessionID   uint8  `json:"pdu_session_id,omitempty"`
+
+	// Traffic statistics
+	BytesUL uint64 `json:"bytes_ul"`
+	BytesDL uint64 `json:"bytes_dl"`
+
+	// QoS parameters
+	QoS5QI      uint8  `json:"qos_5qi,omitempty"`
+	ARPPL       uint8  `json:"arp_priority,omitempty"`
+	GBRUplink   uint64 `json:"gbr_ul_kbps,omitempty"`
+	GBRDownlink uint64 `json:"gbr_dl_kbps,omitempty"`
+	MBRUplink   uint64 `json:"mbr_ul_kbps,omitempty"`
+	MBRDownlink uint64 `json:"mbr_dl_kbps,omitempty"`
+
+	// Status
+	Status     string `json:"status"`
+	Duration   string `json:"duration,omitempty"`
+	LastActive string `json:"last_active,omitempty"`
 }
 
 // Server represents the API server
 type Server struct {
-	router     *gin.Engine
-	upgrader   websocket.Upgrader
-	clients    map[*websocket.Conn]bool
-	clientsMu  sync.Mutex
-	broadcast  chan interface{}
-	
+	router    *gin.Engine
+	upgrader  websocket.Upgrader
+	clients   map[*websocket.Conn]bool
+	clientsMu sync.Mutex
+	broadcast chan interface{}
+
 	// In-memory stats (will be replaced with Prometheus queries)
-	stats      TrafficStats
-	drops      DropStats
-	sessions   []SessionInfo
-	statsMu    sync.RWMutex
+	stats    TrafficStats
+	drops    DropStats
+	sessions []SessionInfo
+	statsMu  sync.RWMutex
 }
 
 func main() {
@@ -74,7 +114,7 @@ func main() {
 	log.Println("============================================================")
 
 	server := NewServer()
-	
+
 	log.Println("[INFO] Starting API server on :8080")
 	if err := server.Run(":8080"); err != nil {
 		log.Fatalf("Server error: %v", err)
@@ -84,7 +124,7 @@ func main() {
 // NewServer creates a new API server
 func NewServer() *Server {
 	s := &Server{
-		router:    gin.Default(),
+		router: gin.Default(),
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all origins for development
@@ -101,6 +141,7 @@ func NewServer() *Server {
 
 	s.setupRoutes()
 	go s.handleBroadcast()
+	go s.collectMetricsFromAgent() // Start collecting metrics from agent
 
 	return s
 }
@@ -127,6 +168,10 @@ func (s *Server) setupRoutes() {
 		api.GET("/sessions", s.handleSessions)
 		api.GET("/sessions/:seid", s.handleSessionDetail)
 		api.POST("/fault/inject", s.handleFaultInject)
+
+		// Proxy demo APIs to agent
+		api.POST("/demo/inject-drop", s.proxyToAgent)
+		api.POST("/demo/inject-session", s.proxyToAgent)
 	}
 
 	// WebSocket for real-time updates
@@ -137,9 +182,9 @@ func (s *Server) setupRoutes() {
 // Health check
 func (s *Server) handleHealth(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"status": "ok",
+		"status":    "ok",
 		"timestamp": time.Now().Format(time.RFC3339),
-		"version": "1.0.0",
+		"version":   "1.0.0",
 	})
 }
 
@@ -173,7 +218,7 @@ func (s *Server) handleSessions(c *gin.Context) {
 // Session detail
 func (s *Server) handleSessionDetail(c *gin.Context) {
 	seid := c.Param("seid")
-	
+
 	s.statsMu.RLock()
 	defer s.statsMu.RUnlock()
 
@@ -211,6 +256,40 @@ func (s *Server) handleFaultInject(c *gin.Context) {
 		"type":   req.Type,
 		"target": req.Target,
 	})
+}
+
+// proxyToAgent proxies demo API requests to the agent
+func (s *Server) proxyToAgent(c *gin.Context) {
+	// Build the agent URL (agent uses /api/ instead of /api/v1/)
+	path := c.Request.URL.Path
+	if strings.HasPrefix(path, "/api/v1/") {
+		path = "/api/" + path[len("/api/v1/"):]
+	}
+	agentURL := "http://localhost:9100" + path
+	if c.Request.URL.RawQuery != "" {
+		agentURL += "?" + c.Request.URL.RawQuery
+	}
+
+	// Create request to agent
+	req, err := http.NewRequest(c.Request.Method, agentURL, c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create request"})
+		return
+	}
+	req.Header.Set("Content-Type", c.GetHeader("Content-Type"))
+
+	// Execute request
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "Agent not available"})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Copy response
+	body, _ := io.ReadAll(resp.Body)
+	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
 }
 
 // WebSocket handler for real-time metrics
@@ -285,30 +364,27 @@ func (s *Server) handleBroadcast() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			s.statsMu.RLock()
-			msg := gin.H{
-				"type": "update",
-				"data": gin.H{
-					"traffic":  s.stats,
-					"drops":    s.drops,
-					"sessions": len(s.sessions),
-				},
-				"timestamp": time.Now().Format(time.RFC3339),
-			}
-			s.statsMu.RUnlock()
-
-			s.clientsMu.Lock()
-			for client := range s.clients {
-				if err := client.WriteJSON(msg); err != nil {
-					client.Close()
-					delete(s.clients, client)
-				}
-			}
-			s.clientsMu.Unlock()
+	for range ticker.C {
+		s.statsMu.RLock()
+		msg := gin.H{
+			"type": "update",
+			"data": gin.H{
+				"traffic":  s.stats,
+				"drops":    s.drops,
+				"sessions": len(s.sessions),
+			},
+			"timestamp": time.Now().Format(time.RFC3339),
 		}
+		s.statsMu.RUnlock()
+
+		s.clientsMu.Lock()
+		for client := range s.clients {
+			if err := client.WriteJSON(msg); err != nil {
+				client.Close()
+				delete(s.clients, client)
+			}
+		}
+		s.clientsMu.Unlock()
 	}
 }
 
@@ -326,7 +402,7 @@ func (s *Server) AddDropEvent(event DropEvent) {
 
 	s.drops.Total++
 	s.drops.RecentDrops = append([]DropEvent{event}, s.drops.RecentDrops...)
-	
+
 	// Keep only last 100 events
 	if len(s.drops.RecentDrops) > 100 {
 		s.drops.RecentDrops = s.drops.RecentDrops[:100]
@@ -339,3 +415,210 @@ func (s *Server) AddDropEvent(event DropEvent) {
 func (s *Server) Run(addr string) error {
 	return s.router.Run(addr)
 }
+
+// collectMetricsFromAgent periodically fetches metrics from the eBPF agent
+func (s *Server) collectMetricsFromAgent() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var prevUplinkBytes, prevDownlinkBytes uint64
+	var prevTime time.Time
+
+	log.Println("[INFO] Starting metrics collection from agent at", agentMetricsURL)
+
+	for range ticker.C {
+		// Fetch Prometheus metrics for traffic
+		metrics, err := s.fetchAgentMetrics()
+		if err != nil {
+			log.Printf("[WARN] Failed to fetch agent metrics: %v", err)
+			continue
+		}
+
+		// Fetch drops from agent API
+		dropsData, err := s.fetchAgentDrops()
+		if err != nil {
+			log.Printf("[WARN] Failed to fetch drops: %v", err)
+		}
+
+		// Fetch sessions from agent API
+		sessionsData, err := s.fetchAgentSessions()
+		if err != nil {
+			log.Printf("[WARN] Failed to fetch sessions: %v", err)
+		}
+
+		now := time.Now()
+
+		// Calculate throughput
+		var uplinkThroughput, downlinkThroughput float64
+		if !prevTime.IsZero() {
+			elapsed := now.Sub(prevTime).Seconds()
+			if elapsed > 0 {
+				uplinkBytesDelta := metrics.uplinkBytes - prevUplinkBytes
+				downlinkBytesDelta := metrics.downlinkBytes - prevDownlinkBytes
+				uplinkThroughput = float64(uplinkBytesDelta*8) / elapsed / 1000000     // Mbps
+				downlinkThroughput = float64(downlinkBytesDelta*8) / elapsed / 1000000 // Mbps
+			}
+		}
+
+		prevUplinkBytes = metrics.uplinkBytes
+		prevDownlinkBytes = metrics.downlinkBytes
+		prevTime = now
+
+		// Update stats
+		s.statsMu.Lock()
+		s.stats = TrafficStats{
+			Uplink: DirectionStats{
+				Packets:     metrics.uplinkPackets,
+				Bytes:       metrics.uplinkBytes,
+				Throughput:  uplinkThroughput,
+				LastUpdated: now.Format(time.RFC3339),
+			},
+			Downlink: DirectionStats{
+				Packets:     metrics.downlinkPackets,
+				Bytes:       metrics.downlinkBytes,
+				Throughput:  downlinkThroughput,
+				LastUpdated: now.Format(time.RFC3339),
+			},
+		}
+
+		// Update drop stats from agent API
+		if dropsData != nil {
+			s.drops = *dropsData
+		}
+
+		// Update sessions from agent API
+		if sessionsData != nil {
+			s.sessions = sessionsData
+		}
+		s.statsMu.Unlock()
+	}
+}
+
+// fetchAgentDrops fetches drop events from agent API
+func (s *Server) fetchAgentDrops() (*DropStats, error) {
+	resp, err := http.Get(agentDropsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch drops: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var dropsData DropStats
+	if err := json.NewDecoder(resp.Body).Decode(&dropsData); err != nil {
+		return nil, fmt.Errorf("failed to decode drops: %w", err)
+	}
+
+	return &dropsData, nil
+}
+
+// fetchAgentSessions fetches sessions from agent API
+func (s *Server) fetchAgentSessions() ([]SessionInfo, error) {
+	resp, err := http.Get(agentSessionsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch sessions: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Total    int           `json:"total"`
+		Sessions []SessionInfo `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode sessions: %w", err)
+	}
+
+	return result.Sessions, nil
+}
+
+// agentMetrics holds parsed metrics from the agent
+type agentMetrics struct {
+	uplinkPackets   uint64
+	downlinkPackets uint64
+	uplinkBytes     uint64
+	downlinkBytes   uint64
+	totalDrops      uint64
+	activeSessions  uint64
+}
+
+// fetchAgentMetrics fetches and parses metrics from the eBPF agent
+func (s *Server) fetchAgentMetrics() (*agentMetrics, error) {
+	resp, err := http.Get(agentMetricsURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch metrics: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	return parsePrometheusMetrics(string(body))
+}
+
+// parsePrometheusMetrics parses Prometheus text format metrics
+func parsePrometheusMetrics(body string) (*agentMetrics, error) {
+	metrics := &agentMetrics{}
+
+	// Regex patterns for different metric formats
+	packetsPattern := regexp.MustCompile(`upf_packets_total\{direction="(\w+)"\}\s+([0-9.e+\-]+)`)
+	bytesPattern := regexp.MustCompile(`upf_bytes_total\{direction="(\w+)"\}\s+([0-9.e+\-]+)`)
+	dropsPattern := regexp.MustCompile(`upf_packet_drops_total\{[^}]*\}\s+([0-9.e+\-]+)`)
+	sessionsPattern := regexp.MustCompile(`upf_active_sessions\s+([0-9.e+\-]+)`)
+
+	// Parse packets
+	for _, match := range packetsPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 3 {
+			value := parseNumber(match[2])
+			switch match[1] {
+			case "uplink":
+				metrics.uplinkPackets = value
+			case "downlink":
+				metrics.downlinkPackets = value
+			}
+		}
+	}
+
+	// Parse bytes
+	for _, match := range bytesPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 3 {
+			value := parseNumber(match[2])
+			switch match[1] {
+			case "uplink":
+				metrics.uplinkBytes = value
+			case "downlink":
+				metrics.downlinkBytes = value
+			}
+		}
+	}
+
+	// Parse drops (sum all drop reasons)
+	for _, match := range dropsPattern.FindAllStringSubmatch(body, -1) {
+		if len(match) == 2 {
+			value := parseNumber(match[1])
+			metrics.totalDrops += value
+		}
+	}
+
+	// Parse active sessions
+	if match := sessionsPattern.FindStringSubmatch(body); len(match) == 2 {
+		metrics.activeSessions = parseNumber(match[1])
+	}
+
+	return metrics, nil
+}
+
+// parseNumber parses both integer and scientific notation
+func parseNumber(s string) uint64 {
+	// Try parsing as float first (handles scientific notation)
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return uint64(f)
+	}
+	// Fall back to uint64
+	if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return v
+	}
+	return 0
+}
+
+// Ensure json and other imports are used
+var _ = json.Marshal

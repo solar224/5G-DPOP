@@ -1,6 +1,6 @@
 package ebpf
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -target bpf" upfMonitor ./bpf/upf_monitor.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -D__TARGET_ARCH_x86" -target amd64 upfMonitor ./bpf/upf_monitor.bpf.c
 
 import (
 	"encoding/binary"
@@ -21,12 +21,23 @@ const (
 	DirectionDownlink = 1
 )
 
-// Drop reason constants
+// Drop reason constants - Enhanced categories
 const (
-	DropReasonNoPDR       = 0
-	DropReasonInvalidTEID = 1
-	DropReasonQOS         = 2
-	DropReasonKernel      = 3
+	DropReasonNoPDR          = 0  // No PDR rule matched
+	DropReasonInvalidTEID    = 1  // Invalid or unknown TEID
+	DropReasonQOS            = 2  // QoS policy violation
+	DropReasonKernel         = 3  // Generic kernel drop
+	DropReasonNoFAR          = 4  // No FAR action defined
+	DropReasonBufferOverflow = 5  // Ring buffer or queue overflow
+	DropReasonTTLExpired     = 6  // TTL/Hop limit expired
+	DropReasonMTUExceeded    = 7  // Packet too large
+	DropReasonMalformed      = 8  // Malformed GTP header
+	DropReasonNoTunnel       = 9  // GTP tunnel not found
+	DropReasonEncapFail      = 10 // Encapsulation failed
+	DropReasonDecapFail      = 11 // Decapsulation failed
+	DropReasonRouting        = 12 // Routing decision drop
+	DropReasonPolicy         = 13 // Policy/ACL drop
+	DropReasonMemory         = 14 // Memory allocation failure
 )
 
 // TrafficCounter represents per-direction traffic statistics
@@ -223,6 +234,67 @@ func (l *Loader) GetTrafficStats() (uplink, downlink TrafficCounter, err error) 
 	return uplink, downlink, nil
 }
 
+// GetTEIDStats retrieves traffic statistics for a specific TEID
+func (l *Loader) GetTEIDStats(teid uint32) (TrafficCounter, error) {
+	var counter TrafficCounter
+
+	if l.objs == nil {
+		return counter, fmt.Errorf("eBPF objects not loaded")
+	}
+
+	if err := l.objs.TeidStats.Lookup(&teid, &counter); err != nil {
+		return counter, err // Not found is also an error
+	}
+
+	return counter, nil
+}
+
+// GetAllTEIDStats retrieves traffic statistics for all TEIDs
+func (l *Loader) GetAllTEIDStats() (map[uint32]TrafficCounter, error) {
+	result := make(map[uint32]TrafficCounter)
+
+	if l.objs == nil {
+		return result, fmt.Errorf("eBPF objects not loaded")
+	}
+
+	var key uint32
+	var value TrafficCounter
+
+	iter := l.objs.TeidStats.Iterate()
+	for iter.Next(&key, &value) {
+		result[key] = value
+	}
+
+	if err := iter.Err(); err != nil {
+		return result, fmt.Errorf("failed to iterate teid_stats: %w", err)
+	}
+
+	return result, nil
+}
+
+// GetAllUEIPStats retrieves traffic statistics for all UE IPs (downlink)
+func (l *Loader) GetAllUEIPStats() (map[uint32]TrafficCounter, error) {
+	result := make(map[uint32]TrafficCounter)
+
+	if l.objs == nil {
+		return result, fmt.Errorf("eBPF objects not loaded")
+	}
+
+	var key uint32
+	var value TrafficCounter
+
+	iter := l.objs.UeIpStats.Iterate()
+	for iter.Next(&key, &value) {
+		result[key] = value
+	}
+
+	if err := iter.Err(); err != nil {
+		return result, fmt.Errorf("failed to iterate ue_ip_stats: %w", err)
+	}
+
+	return result, nil
+}
+
 // UpdateSessionMapping adds or updates a TEID to session mapping
 func (l *Loader) UpdateSessionMapping(teid uint32, session SessionInfo) error {
 	if l.objs == nil {
@@ -248,6 +320,21 @@ func (l *Loader) EnableDetailedTracing(enabled bool) error {
 	}
 
 	key := uint32(0)
+	value := uint32(0)
+	if enabled {
+		value = 1
+	}
+
+	return l.objs.AgentConfig.Update(&key, &value, ebpf.UpdateAny)
+}
+
+// EnableDropTracing enables or disables kfree_skb drop tracing
+func (l *Loader) EnableDropTracing(enabled bool) error {
+	if l.objs == nil {
+		return fmt.Errorf("eBPF objects not loaded")
+	}
+
+	key := uint32(1) // config key 1 = drop tracing
 	value := uint32(0)
 	if enabled {
 		value = 1
@@ -287,9 +374,31 @@ func FormatDropReason(reason uint8) string {
 	case DropReasonInvalidTEID:
 		return "INVALID_TEID"
 	case DropReasonQOS:
-		return "QOS_DROP"
+		return "QOS_VIOLATION"
 	case DropReasonKernel:
 		return "KERNEL_DROP"
+	case DropReasonNoFAR:
+		return "NO_FAR_ACTION"
+	case DropReasonBufferOverflow:
+		return "BUFFER_OVERFLOW"
+	case DropReasonTTLExpired:
+		return "TTL_EXPIRED"
+	case DropReasonMTUExceeded:
+		return "MTU_EXCEEDED"
+	case DropReasonMalformed:
+		return "MALFORMED_GTP"
+	case DropReasonNoTunnel:
+		return "NO_GTP_TUNNEL"
+	case DropReasonEncapFail:
+		return "ENCAP_FAILED"
+	case DropReasonDecapFail:
+		return "DECAP_FAILED"
+	case DropReasonRouting:
+		return "ROUTING_DROP"
+	case DropReasonPolicy:
+		return "POLICY_DROP"
+	case DropReasonMemory:
+		return "MEMORY_ERROR"
 	default:
 		return "UNKNOWN"
 	}

@@ -85,9 +85,21 @@ export function useMetrics(): MetricsState {
                 fetchSessions(),
             ])
 
+            // Debug log
+            console.log('useMetrics poll:', {
+                uplink_mbps: trafficData.uplink.throughput_mbps,
+                downlink_mbps: trafficData.downlink.throughput_mbps,
+                uplink_pkts: trafficData.uplink.packets,
+            })
+
             setMetrics(trafficData)
-            setDrops(dropsData)
-            setSessions(sessionsData.sessions)
+            // Ensure drops has proper defaults for null values
+            setDrops({
+                ...dropsData,
+                recent_drops: dropsData.recent_drops || [],
+                by_reason: dropsData.by_reason || {},
+            })
+            setSessions(sessionsData.sessions || [])
             setError(null)
         } catch (e) {
             setError('Failed to fetch metrics')
