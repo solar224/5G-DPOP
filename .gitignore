@@ -1,0 +1,27 @@
+# Binaries
+bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Logs
+*.log
+logs/
+
+# Go
+vendor/
+go.work
+
+# Node/Web
+web/node_modules/
+web/dist/
+web/.vite/
+web/.env
+web/.env.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+.DS_Store
