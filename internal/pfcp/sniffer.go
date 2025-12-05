@@ -56,18 +56,19 @@ const (
 
 // Session represents a PFCP session with its associated TEIDs
 type Session struct {
-	SEID       uint64
-	LocalSEID  uint64
-	RemoteSEID uint64
-	UEIP       net.IP
-	UPFIP      net.IP
-	GNBIP      net.IP   // Downlink Peer IP (gNB or next UPF)
-	UplinkPeerIP net.IP // Uplink Peer IP (gNB or prev UPF)
-	TEIDs      []uint32 // Associated GTP TEIDs
-	CreatedAt  time.Time
-	ModifiedAt time.Time
-	PDRCount   int
-	FARCount   int
+	SEID         uint64
+	LocalSEID    uint64
+	RemoteSEID   uint64
+	UEIP         net.IP
+	UPFIP        net.IP
+	GNBIP        net.IP   // Downlink Peer IP (gNB for N3)
+	UplinkPeerIP net.IP   // Uplink Peer IP (gNB or prev UPF)
+	N9PeerIP     net.IP   // N9 Peer UPF IP (for ULCL: i-upf <-> psa-upf)
+	TEIDs        []uint32 // Associated GTP TEIDs
+	CreatedAt    time.Time
+	ModifiedAt   time.Time
+	PDRCount     int
+	FARCount     int
 
 	// Extended session info
 	SUPI        string // Subscriber Permanent ID (IMSI)
@@ -353,6 +354,14 @@ func (s *Sniffer) captureLoop() {
 }
 
 func (s *Sniffer) processPacket(packet gopacket.Packet) {
+	// Get IP layer to extract source and destination IPs
+	var srcIP, dstIP net.IP
+	if ipLayer := packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
+		ip, _ := ipLayer.(*layers.IPv4)
+		srcIP = ip.SrcIP
+		dstIP = ip.DstIP
+	}
+
 	// Get UDP layer
 	udpLayer := packet.Layer(layers.LayerTypeUDP)
 	if udpLayer == nil {
@@ -411,17 +420,18 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 	// Process based on message type
 	// Only create sessions from Establishment Request (has complete data)
 	// Response and Modification only update existing sessions
+	// For Session Establishment Request: srcIP=SMF, dstIP=UPF
 	switch msgType {
 	case MsgTypeSessionEstablishmentRequest:
-		log.Printf("[PFCP-DEBUG] Session Establishment Request: SEID=0x%x, msgLen=%d, ieDataLen=%d", seid, msgLen, len(ieData))
-		s.handleSessionEstablishmentRequest(ieData)
+		log.Printf("[PFCP-DEBUG] Session Establishment Request: SEID=0x%x, SMF=%s, UPF=%s, msgLen=%d", seid, srcIP, dstIP, msgLen)
+		s.handleSessionEstablishmentRequest(ieData, dstIP) // dstIP is the UPF receiving this request
 	case MsgTypeSessionEstablishmentResponse:
 		// Response contains the UPF-assigned SEID, but limited data
 		// We'll update existing session if we can match by F-TEID
 		log.Printf("[PFCP-DEBUG] Session Establishment Response: SEID=0x%x (ignored - use Request data)", seid)
 	case MsgTypeSessionModificationRequest:
-		log.Printf("[PFCP-DEBUG] Session Modification Request: SEID=0x%x", seid)
-		s.handleSessionModification(seid, ieData)
+		log.Printf("[PFCP-DEBUG] Session Modification Request: SEID=0x%x, UPF=%s", seid, dstIP)
+		s.handleSessionModification(seid, ieData, dstIP)
 	case MsgTypeSessionModificationResponse:
 		log.Printf("[PFCP-DEBUG] Session Modification Response: SEID=0x%x (ignored)", seid)
 	case MsgTypeSessionDeletionRequest:
@@ -437,7 +447,8 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 
 // handleSessionEstablishmentRequest handles Session Establishment Request
 // This is the only place where new sessions are created (Request has all the data)
-func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte) {
+// upfIP is the destination IP of the PFCP message (the UPF receiving this request)
+func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte, upfIP net.IP) {
 	// First, extract UE IP - this is our primary key for session identification
 	ueIP := s.extractUEIP(ieData)
 	if ueIP == nil {
@@ -446,7 +457,7 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte) {
 	}
 
 	ueIPStr := ueIP.String()
-	log.Printf("[PFCP] Session Establishment Request: UE_IP=%s", ueIPStr)
+	log.Printf("[PFCP] Session Establishment Request: UE_IP=%s, UPF=%s", ueIPStr, upfIP)
 
 	// Extract TEIDs first - we need these to properly identify the session
 	teids := s.extractUniqueTEIDs(ieData, nil)
@@ -459,6 +470,7 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte) {
 	session := &Session{
 		SEID:       0, // Will be assigned by AddSession
 		UEIP:       ueIP,
+		UPFIP:      upfIP, // Set UPF IP from PFCP message destination
 		CreatedAt:  time.Now(),
 		LastActive: time.Now(),
 		TEIDs:      teids,
@@ -468,18 +480,18 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte) {
 	// Parse IEs to extract all available info
 	s.extractSessionInfo(ieData, session)
 
-	// Extract F-TEID details (UPF/gNB IPs)
+	// Extract F-TEID details (gNB/peer UPF IPs from Outer Header Creation)
 	s.extractFTEIDDetails(ieData, session)
 
 	// Add session (will handle deduplication and SEID assignment)
 	s.correlation.AddSession(session)
 
-	log.Printf("   └─ Session created: TEIDs: %v, UE_IP: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
-		session.TEIDs, ueIP, session.DNN, session.QFI, session.MBRUplink, session.MBRDownlink)
+	log.Printf("   └─ Session created: TEIDs: %v, UE_IP: %v, UPF_IP: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
+		session.TEIDs, ueIP, upfIP, session.DNN, session.QFI, session.MBRUplink, session.MBRDownlink)
 }
 
-func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte) {
-	log.Printf("[PFCP] Session Modification: SEID=0x%x", seid)
+func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP net.IP) {
+	log.Printf("[PFCP] Session Modification: SEID=0x%x, UPF=%s", seid, upfIP)
 
 	// First try to find session by UE IP (our primary key)
 	ueIP := s.extractUEIP(ieData)
@@ -514,11 +526,17 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte) {
 		session = &Session{
 			SEID:       0, // Will be assigned by AddSession
 			UEIP:       ueIP,
+			UPFIP:      upfIP, // Set UPF IP from PFCP message destination
 			CreatedAt:  time.Now(),
 			LastActive: time.Now(),
 			TEIDs:      make([]uint32, 0),
 			Status:     "Active",
 		}
+	}
+
+	// Update UPF IP if not already set
+	if session.UPFIP == nil && upfIP != nil {
+		session.UPFIP = upfIP
 	}
 
 	// Extract session info from modification IEs
@@ -539,8 +557,8 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte) {
 	session.LastActive = time.Now()
 	s.correlation.AddSession(session)
 
-	log.Printf("   └─ Updated: TEIDs: %v, UE_IP: %v, MBR: UL=%d/DL=%d kbps",
-		session.TEIDs, session.UEIP, session.MBRUplink, session.MBRDownlink)
+	log.Printf("   └─ Updated: TEIDs: %v, UE_IP: %v, UPF_IP: %v, MBR: UL=%d/DL=%d kbps",
+		session.TEIDs, session.UEIP, session.UPFIP, session.MBRUplink, session.MBRDownlink)
 }
 
 func (s *Sniffer) handleSessionDeletion(seid uint64) {
@@ -671,26 +689,51 @@ func (s *Sniffer) extractSessionInfo(ieData []byte, session *Session) {
 	})
 }
 
-// extractFTEIDDetails extracts F-TEID IP addresses from Session Establishment
-// Only extracts UPF IP from F-TEID (gNB IP comes from Modification)
+// extractFTEIDDetails extracts F-TEID and Outer Header Creation details
+// For ULCL: Outer Header Creation in i-upf's FAR points to psa-upf (N9 interface)
+// For single UPF: Outer Header Creation points to gNB (N3)
 func (s *Sniffer) extractFTEIDDetails(ieData []byte, session *Session) {
-	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
-		if ieType == IETypeFTEID && len(ieValue) >= 5 {
-			flags := ieValue[0]
-			offset := 5 // Skip flags (1) + TEID (4)
+	// Known UPF IPs in ULCL configuration (could be made configurable)
+	// For now, we detect UPF IPs by checking common UPF IP patterns
+	isUPFIP := func(ip net.IP) bool {
+		// Check if IP is in 10.100.200.x range (free5gc-compose network)
+		// UPFs are typically at .2, .3, .4 etc, while gNB is at higher addresses like .15
+		if ip4 := ip.To4(); ip4 != nil {
+			if ip4[0] == 10 && ip4[1] == 100 && ip4[2] == 200 {
+				// UPFs are typically in lower addresses (2-10), gNB is typically higher
+				return ip4[3] >= 2 && ip4[3] <= 10
+			}
+		}
+		return false
+	}
 
-			// Check for IPv4 address (bit 0)
-			if flags&0x01 != 0 && len(ieValue) >= offset+4 {
-				ip := net.IP(ieValue[offset : offset+4])
-				// In Session Establishment, F-TEID contains UPF's N3 interface IP
-				if session.UPFIP == nil {
-					session.UPFIP = ip
-					log.Printf("   └─ F-TEID UPF IP: %s", ip)
+	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
+		// Outer Header Creation contains the destination for forwarded packets
+		if ieType == IETypeOuterHeaderCreation && len(ieValue) >= 10 {
+			// Flags (2) + TEID (4) + IPv4 (4)
+			ip := net.IP(make([]byte, 4))
+			copy(ip, ieValue[6:10])
+
+			// Skip if it's the same as this UPF's IP
+			if session.UPFIP != nil && ip.Equal(session.UPFIP) {
+				return
+			}
+
+			// Determine if this is N9 (peer UPF) or N3 (gNB) based on IP
+			if isUPFIP(ip) {
+				// This is likely another UPF (N9 peer)
+				if session.N9PeerIP == nil {
+					session.N9PeerIP = ip
+					log.Printf("   └─ Outer Header Creation N9 peer UPF: %s", ip)
+				}
+			} else {
+				// This is likely gNB (N3)
+				if session.GNBIP == nil {
+					session.GNBIP = ip
+					log.Printf("   └─ Outer Header Creation gNB (N3): %s", ip)
 				}
 			}
 		}
-		// Note: We don't extract gNB IP from Outer Header Creation in Establishment
-		// because it may point to N6 (DN) direction, not N3 (gNB)
 	})
 }
 

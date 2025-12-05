@@ -100,15 +100,16 @@ type SessionJSON struct {
 	PacketsDL uint64   `json:"packets_dl"`
 
 	// Extended fields
-	UPFIP       string `json:"upf_ip,omitempty"`
-	GNBIP       string `json:"gnb_ip,omitempty"`
+	UPFIP        string `json:"upf_ip,omitempty"`
+	GNBIP        string `json:"gnb_ip,omitempty"`
 	UplinkPeerIP string `json:"uplink_peer_ip,omitempty"`
-	SUPI        string `json:"supi,omitempty"`
-	DNN         string `json:"dnn,omitempty"`
-	SNssai      string `json:"s_nssai,omitempty"`
-	QFI         uint8  `json:"qfi,omitempty"`
-	SessionType string `json:"session_type,omitempty"`
-	SessionID   uint8  `json:"pdu_session_id,omitempty"`
+	N9PeerIP     string `json:"n9_peer_ip,omitempty"` // N9 peer UPF IP (for ULCL)
+	SUPI         string `json:"supi,omitempty"`
+	DNN          string `json:"dnn,omitempty"`
+	SNssai       string `json:"s_nssai,omitempty"`
+	QFI          uint8  `json:"qfi,omitempty"`
+	SessionType  string `json:"session_type,omitempty"`
+	SessionID    uint8  `json:"pdu_session_id,omitempty"`
 
 	// Traffic statistics
 	BytesUL uint64 `json:"bytes_ul"`
@@ -212,7 +213,7 @@ func main() {
 		if event.Direction == ebpf.DirectionUplink && event.TEID > 0 {
 			// Convert uint32 IP to net.IP
 			srcIP := net.IPv4(byte(event.SrcIP), byte(event.SrcIP>>8), byte(event.SrcIP>>16), byte(event.SrcIP>>24))
-			
+
 			// Update session with Uplink Peer IP
 			pfcpCorrelation.UpdateUplinkPeer(event.TEID, srcIP)
 		}
@@ -365,6 +366,11 @@ func handleSessionsAPI(w http.ResponseWriter, r *http.Request) {
 			uplinkPeerIP = s.UplinkPeerIP.String()
 		}
 
+		n9PeerIP := ""
+		if s.N9PeerIP != nil {
+			n9PeerIP = s.N9PeerIP.String()
+		}
+
 		// Calculate duration
 		duration := time.Since(s.CreatedAt)
 		durationStr := formatDuration(duration)
@@ -391,15 +397,16 @@ func handleSessionsAPI(w http.ResponseWriter, r *http.Request) {
 			PacketsDL: s.PacketsDL,
 
 			// Extended fields
-			UPFIP:       upfIP,
-			GNBIP:       gnbIP,
+			UPFIP:        upfIP,
+			GNBIP:        gnbIP,
 			UplinkPeerIP: uplinkPeerIP,
-			SUPI:        s.SUPI,
-			DNN:         s.DNN,
-			SNssai:      s.SNssai,
-			QFI:         s.QFI,
-			SessionType: s.SessionType,
-			SessionID:   s.SessionID,
+			N9PeerIP:     n9PeerIP,
+			SUPI:         s.SUPI,
+			DNN:          s.DNN,
+			SNssai:       s.SNssai,
+			QFI:          s.QFI,
+			SessionType:  s.SessionType,
+			SessionID:    s.SessionID,
 
 			// Traffic
 			BytesUL: s.BytesUL,

@@ -68,15 +68,16 @@ type SessionInfo struct {
 	PacketsDL uint64   `json:"packets_dl"`
 
 	// Extended fields
-	UPFIP       string `json:"upf_ip,omitempty"`
-	GNBIP       string `json:"gnb_ip,omitempty"`
+	UPFIP        string `json:"upf_ip,omitempty"`
+	GNBIP        string `json:"gnb_ip,omitempty"`
 	UplinkPeerIP string `json:"uplink_peer_ip,omitempty"`
-	SUPI        string `json:"supi,omitempty"`
-	DNN         string `json:"dnn,omitempty"`
-	SNssai      string `json:"s_nssai,omitempty"`
-	QFI         uint8  `json:"qfi,omitempty"`
-	SessionType string `json:"session_type,omitempty"`
-	SessionID   uint8  `json:"pdu_session_id,omitempty"`
+	N9PeerIP     string `json:"n9_peer_ip,omitempty"` // N9 peer UPF IP (for ULCL)
+	SUPI         string `json:"supi,omitempty"`
+	DNN          string `json:"dnn,omitempty"`
+	SNssai       string `json:"s_nssai,omitempty"`
+	QFI          uint8  `json:"qfi,omitempty"`
+	SessionType  string `json:"session_type,omitempty"`
+	SessionID    uint8  `json:"pdu_session_id,omitempty"`
 
 	// Traffic statistics
 	BytesUL uint64 `json:"bytes_ul"`
@@ -729,24 +730,30 @@ func (s *Server) handleTopology(c *gin.Context) {
 		}
 
 		// Handle Core Peer (PSA-UPF in ULCL scenario)
-		// If GNBIP is present and different from Access Peer, it's likely the Core-side UPF
-		if session.GNBIP != "" && session.GNBIP != accessPeerIP {
-			corePeerIP := session.GNBIP
-			
+		// Use N9PeerIP if available (from Outer Header Creation pointing to another UPF)
+		n9PeerIP := session.N9PeerIP
+		if n9PeerIP == "" {
+			// Fallback: If GNBIP is present and different from Access Peer, it might be the Core-side UPF
+			if session.GNBIP != "" && session.GNBIP != accessPeerIP {
+				n9PeerIP = session.GNBIP
+			}
+		}
+
+		if n9PeerIP != "" {
 			// Only create if not exists
-			if _, exists := nodes[corePeerIP]; !exists {
-				nodes[corePeerIP] = TopologyNode{
-					ID:    corePeerIP,
-					Type:  "upf", // Heuristic: Core peer of a UPF is likely another UPF
-					Label: "UPF " + corePeerIP,
-					IP:    corePeerIP,
+			if _, exists := nodes[n9PeerIP]; !exists {
+				nodes[n9PeerIP] = TopologyNode{
+					ID:    n9PeerIP,
+					Type:  "upf",
+					Label: "UPF " + n9PeerIP,
+					IP:    n9PeerIP,
 				}
 			}
 
-			// Link: UPF -> Core Peer (N9)
+			// Link: UPF -> N9 Peer UPF (N9)
 			links = append(links, TopologyLink{
 				Source: upfIP,
-				Target: corePeerIP,
+				Target: n9PeerIP,
 				Label:  "N9",
 				Type:   "n9",
 			})
