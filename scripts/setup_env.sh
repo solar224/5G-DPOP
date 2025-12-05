@@ -82,8 +82,8 @@ install_go() {
     if ! grep -q "/usr/local/go/bin" ~/.bashrc; then
         echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
         echo 'export PATH=$PATH:$(go env GOPATH)/bin' >> ~/.bashrc
+        print_warning "Added Go to ~/.bashrc. Run 'source ~/.bashrc' after setup completes."
     fi
-    
     export PATH=$PATH:/usr/local/go/bin
     print_status "Go $GO_VERSION installed"
 }
