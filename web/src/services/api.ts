@@ -431,21 +431,21 @@ export const DROP_REASON_DATABASE: Record<string, DropReasonInfo> = {
 }
 
 export interface SessionInfo {
-    // 基本識別 (後端回傳字串格式)
-    seid: string           // "0x1234" 格式
+    // Basic identifiers (backend returns string format)
+    seid: string           // "0x1234" format
     ue_ip: string
-    teids: string[]        // ["0x1a", "0x1b"] 格式
-    teid_ul?: string       // Uplink TEID (gNB -> UPF) "0x1a" 格式
-    teid_dl?: string       // Downlink TEID (UPF -> gNB) "0x1b" 格式
-    created_at: string     // RFC3339 格式 "2025-11-29T16:22:12Z"
+    teids: string[]        // ["0x1a", "0x1b"] format
+    teid_ul?: string       // Uplink TEID (gNB -> UPF) "0x1a" format
+    teid_dl?: string       // Downlink TEID (UPF -> gNB) "0x1b" format
+    created_at: string     // RFC3339 format "2025-11-29T16:22:12Z"
 
-    // 封包統計
+    // Packet statistics
     packets_ul: number
     packets_dl: number
     bytes_ul: number
     bytes_dl: number
 
-    // 5G 識別資訊
+    // 5G identifiers
     supi?: string          // "imsi-208930000000001"
     dnn?: string           // "internet"
     s_nssai?: string       // "SST:1, SD:010203"
@@ -453,19 +453,19 @@ export interface SessionInfo {
     session_type?: string  // "IPv4"
     pdu_session_id?: number
 
-    // 網路節點 IP
+    // Network node IPs
     upf_ip?: string
     gnb_ip?: string
 
-    // QoS 參數
-    qos_5qi?: number       // 5QI 值
+    // QoS parameters
+    qos_5qi?: number       // 5QI value
     arp_priority?: number
     gbr_ul_kbps?: number
     gbr_dl_kbps?: number
     mbr_ul_kbps?: number
     mbr_dl_kbps?: number
 
-    // 狀態
+    // Status
     status: string
     duration?: string
     last_active?: string

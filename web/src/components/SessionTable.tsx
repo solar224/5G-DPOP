@@ -49,7 +49,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
             <div className={`${modalBg} rounded-xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto`}>
                 <div className="bg-gradient-to-r from-cyan-600 to-blue-600 px-6 py-4 rounded-t-xl flex justify-between items-center sticky top-0">
                     <div>
-                        <h2 className="text-xl font-bold text-white">PDU Session 詳細資訊</h2>
+                        <h2 className="text-xl font-bold text-white">PDU Session Details</h2>
                         <p className="text-cyan-100 text-sm">SEID: {session.seid}</p>
                     </div>
                     <button
@@ -68,17 +68,17 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10 6H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V8a2 2 0 00-2-2h-5m-4 0V5a2 2 0 114 0v1m-4 0a2 2 0 104 0m-5 8a2 2 0 100-4 2 2 0 000 4zm0 0c1.306 0 2.417.835 2.83 2M9 14a3.001 3.001 0 00-2.83 2M15 11h3m-3 4h2" />
                             </svg>
-                            用戶識別
+                            User Identity
                         </h3>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <InfoCard
-                                label="SUPI (用戶永久識別)"
-                                value={session.supi || '未提供'}
+                                label="SUPI (Subscriber Permanent ID)"
+                                value={session.supi || 'Not provided'}
                                 icon="🆔"
                                 theme={theme}
                             />
                             <InfoCard
-                                label="UE IP 地址"
+                                label="UE IP Address"
                                 value={session.ue_ip || 'N/A'}
                                 icon="🌐"
                                 theme={theme}
@@ -103,12 +103,12 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 5a1 1 0 011-1h14a1 1 0 011 1v2a1 1 0 01-1 1H5a1 1 0 01-1-1V5zM4 13a1 1 0 011-1h6a1 1 0 011 1v6a1 1 0 01-1 1H5a1 1 0 01-1-1v-6zM16 13a1 1 0 011-1h2a1 1 0 011 1v6a1 1 0 01-1 1h-2a1 1 0 01-1-1v-6z" />
                             </svg>
-                            網路與 QoS 資訊
+                            Network & QoS Info
                         </h3>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <InfoCard
                                 label="DNN (Data Network Name)"
-                                value={session.dnn || '未解析'}
+                                value={session.dnn || 'Not resolved'}
                                 icon="📡"
                                 theme={theme}
                             />
@@ -126,15 +126,15 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4" />
                             </svg>
-                            GTP-U 隧道資訊
+                            GTP-U Tunnel Info
                         </h3>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div className={`${sectionBg} rounded-lg p-4 border border-purple-500/30`}>
-                                <h4 className="text-purple-300 font-medium mb-2">📤 UPF 端點</h4>
+                                <h4 className="text-purple-300 font-medium mb-2">📤 UPF Endpoint</h4>
                                 <div className="space-y-2">
                                     <div className="flex justify-between">
-                                        <span className={textSecondary}>IP 地址:</span>
-                                        <span className={`${textPrimary} font-mono`}>{session.upf_ip || '未知'}</span>
+                                        <span className={textSecondary}>IP Address:</span>
+                                        <span className={`${textPrimary} font-mono`}>{session.upf_ip || 'Unknown'}</span>
                                     </div>
                                     <div className="flex justify-between">
                                         <span className={textSecondary}>TEID UL (gNB→UPF):</span>
@@ -151,11 +151,11 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                 </div>
                             </div>
                             <div className={`${sectionBg} rounded-lg p-4 border border-blue-500/30`}>
-                                <h4 className="text-blue-300 font-medium mb-2">📥 gNB 端點</h4>
+                                <h4 className="text-blue-300 font-medium mb-2">📥 gNB Endpoint</h4>
                                 <div className="space-y-2">
                                     <div className="flex justify-between">
-                                        <span className={textSecondary}>IP 地址:</span>
-                                        <span className={`${textPrimary} font-mono`}>{session.gnb_ip || '未知'}</span>
+                                        <span className={textSecondary}>IP Address:</span>
+                                        <span className={`${textPrimary} font-mono`}>{session.gnb_ip || 'Unknown'}</span>
                                     </div>
                                 </div>
                             </div>
@@ -168,12 +168,12 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                                 </svg>
-                                頻寬限制 (MBR)
+                                Bandwidth Limit (MBR)
                             </h3>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 {session.mbr_ul_kbps && (
                                     <InfoCard
-                                        label="MBR 上行"
+                                        label="MBR Uplink"
                                         value={`${(session.mbr_ul_kbps / 1000).toFixed(0)} Mbps`}
                                         icon="⬆️"
                                         theme={theme}
@@ -181,7 +181,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                 )}
                                 {session.mbr_dl_kbps && (
                                     <InfoCard
-                                        label="MBR 下行"
+                                        label="MBR Downlink"
                                         value={`${(session.mbr_dl_kbps / 1000).toFixed(0)} Mbps`}
                                         icon="⬇️"
                                         theme={theme}
@@ -196,32 +196,32 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
                             </svg>
-                            流量統計
+                            Traffic Statistics
                         </h3>
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
                             <StatCard
-                                label="上行封包數"
+                                label="Uplink Packets"
                                 value={(session.packets_ul || 0).toLocaleString()}
                                 icon="📤"
                                 color="blue"
                                 theme={theme}
                             />
                             <StatCard
-                                label="下行封包數"
+                                label="Downlink Packets"
                                 value={(session.packets_dl || 0).toLocaleString()}
                                 icon="📥"
                                 color="green"
                                 theme={theme}
                             />
                             <StatCard
-                                label="上行流量"
+                                label="Uplink Traffic"
                                 value={formatBytes(session.bytes_ul || 0)}
                                 icon="⬆️"
                                 color="blue"
                                 theme={theme}
                             />
                             <StatCard
-                                label="下行流量"
+                                label="Downlink Traffic"
                                 value={formatBytes(session.bytes_dl || 0)}
                                 icon="⬇️"
                                 color="green"
@@ -230,7 +230,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </div>
                         <div className={`mt-4 ${sectionBg} rounded-lg p-4`}>
                             <div className="flex justify-between items-center">
-                                <span className={textSecondary}>總流量</span>
+                                <span className={textSecondary}>Total Traffic</span>
                                 <span className={`text-xl font-bold ${textPrimary}`}>
                                     {formatBytes((session.bytes_ul || 0) + (session.bytes_dl || 0))}
                                 </span>
@@ -246,8 +246,8 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                         />
                                     </div>
                                     <div className={`flex justify-between text-xs ${textSecondary} mt-1`}>
-                                        <span>上行: {(((session.bytes_ul || 0) / ((session.bytes_ul || 0) + (session.bytes_dl || 0))) * 100).toFixed(1)}%</span>
-                                        <span>下行: {(((session.bytes_dl || 0) / ((session.bytes_ul || 0) + (session.bytes_dl || 0))) * 100).toFixed(1)}%</span>
+                                        <span>UL: {(((session.bytes_ul || 0) / ((session.bytes_ul || 0) + (session.bytes_dl || 0))) * 100).toFixed(1)}%</span>
+                                        <span>DL: {(((session.bytes_dl || 0) / ((session.bytes_ul || 0) + (session.bytes_dl || 0))) * 100).toFixed(1)}%</span>
                                     </div>
                                 </>
                             )}
@@ -259,23 +259,23 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
                             </svg>
-                            時間與狀態
+                            Time & Status
                         </h3>
                         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                             <InfoCard
-                                label="建立時間"
+                                label="Created At"
                                 value={formatTimestamp(session.created_at)}
                                 icon="🕐"
                                 theme={theme}
                             />
                             <InfoCard
-                                label="Session 持續時間"
+                                label="Session Duration"
                                 value={session.duration || 'N/A'}
                                 icon="⏱️"
                                 theme={theme}
                             />
                             <InfoCard
-                                label="最後活動時間"
+                                label="Last Activity"
                                 value={formatTimestamp(session.last_active)}
                                 icon="🔄"
                                 theme={theme}
@@ -285,7 +285,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <div className="flex items-center gap-3">
                                 <div className={`w-3 h-3 rounded-full ${session.status === 'Active' ? 'bg-green-500 animate-pulse' : 'bg-gray-500'}`} />
                                 <span className={`text-lg font-medium ${textPrimary}`}>
-                                    {session.status === 'Active' ? '🟢 活躍中' : session.status || '未知'}
+                                    {session.status === 'Active' ? '🟢 Active' : session.status || 'Unknown'}
                                 </span>
                             </div>
                         </div>
@@ -296,7 +296,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
                             </svg>
-                            SEID ↔ TEID 映射關係
+                            SEID ↔ TEID Mapping
                         </h3>
                         <div className={`${theme === 'dark' ? 'bg-gray-900/50' : 'bg-gray-50'} rounded-lg p-4 border border-pink-500/30`}>
                             <div className="flex flex-col md:flex-row items-center justify-center gap-4">
@@ -308,7 +308,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                     <svg className="w-8 h-8 text-pink-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 8l4 4m0 0l-4 4m4-4H3" />
                                     </svg>
-                                    <span className={`text-xs ${textSecondary}`}>對應</span>
+                                    <span className={`text-xs ${textSecondary}`}>maps to</span>
                                 </div>
                                 <div className="bg-purple-600/30 rounded-lg px-6 py-4 text-center border border-purple-500">
                                     <div className="text-purple-300 text-sm mb-1">GTP-U Tunnel</div>
@@ -321,7 +321,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                                 </div>
                             </div>
                             <div className={`mt-4 text-center text-sm ${textSecondary}`}>
-                                此 PDU Session 透過 PFCP 協定建立，並在用戶平面使用 GTP-U 隧道傳輸資料
+                                This PDU Session is established via PFCP protocol and uses GTP-U tunnel for user plane data transmission
                             </div>
                         </div>
                     </section>
@@ -332,7 +332,7 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         onClick={onClose}
                         className="w-full bg-cyan-600 hover:bg-cyan-500 text-white font-medium py-2 px-4 rounded-lg transition-colors"
                     >
-                        關閉
+                        Close
                     </button>
                 </div>
             </div>
@@ -421,7 +421,7 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                 setSessions(allSessions);
                 setError(null);
             } catch (err) {
-                setError('無法載入 PDU Sessions');
+                setError('Failed to load PDU Sessions');
                 console.error(err);
             } finally {
                 setIsLoading(false);
@@ -504,7 +504,7 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                 <div className="relative flex-1 max-w-md">
                     <input
                         type="text"
-                        placeholder="搜尋 SEID, UE IP, SUPI, DNN, TEID..."
+                        placeholder="Search SEID, UE IP, SUPI, DNN, TEID..."
                         value={searchTerm}
                         onChange={(e) => setSearchTerm(e.target.value)}
                         className={`w-full rounded-lg pl-10 pr-4 py-2 focus:outline-none focus:ring-2 focus:ring-cyan-500 ${theme === 'dark'
@@ -524,11 +524,11 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
 
                 <div className="flex gap-4 text-sm">
                     <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>
-                        總共 <span className="text-cyan-400 font-bold">{sessions.length}</span> 個 Sessions
+                        Total <span className="text-cyan-400 font-bold">{sessions.length}</span> Sessions
                     </span>
                     {searchTerm && (
                         <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>
-                            符合 <span className="text-green-400 font-bold">{filteredAndSortedSessions.length}</span> 筆
+                            Matched <span className="text-green-400 font-bold">{filteredAndSortedSessions.length}</span> results
                         </span>
                     )}
                 </div>
@@ -536,10 +536,10 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
 
             <div className="flex gap-2 flex-wrap">
                 {[
-                    { field: 'created_at' as const, label: '建立時間' },
+                    { field: 'created_at' as const, label: 'Created At' },
                     { field: 'seid' as const, label: 'SEID' },
                     { field: 'ue_ip' as const, label: 'UE IP' },
-                    { field: 'packets' as const, label: '封包數' },
+                    { field: 'packets' as const, label: 'Packets' },
                 ].map(({ field, label }) => (
                     <button
                         key={field}
@@ -562,12 +562,12 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
             {filteredAndSortedSessions.length === 0 ? (
                 <div className={`rounded-lg p-8 text-center ${theme === 'dark' ? 'bg-gray-800/50' : 'bg-gray-100'}`}>
                     <div className={`text-lg mb-2 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
-                        {searchTerm ? '🔍 沒有符合的 Sessions' : '目前沒有活躍的 PDU Sessions'}
+                        {searchTerm ? '🔍 No matching Sessions' : 'No active PDU Sessions'}
                     </div>
                     <p className={`text-sm ${theme === 'dark' ? 'text-gray-500' : 'text-gray-500'}`}>
                         {searchTerm
-                            ? '請嘗試其他搜尋條件'
-                            : '當 UE 建立 PDU Session 時會自動顯示在這裡'
+                            ? 'Try different search criteria'
+                            : 'Sessions will appear here when UE establishes PDU Session'
                         }
                     </p>
                 </div>
@@ -595,7 +595,7 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                                         ? 'bg-green-500/20 text-green-400'
                                         : 'bg-gray-500/20 text-gray-400'
                                         }`}>
-                                        {session.status === 'Active' ? '活躍' : session.status || '未知'}
+                                        {session.status === 'Active' ? 'Active' : session.status || 'Unknown'}
                                     </div>
                                 </div>
 
@@ -618,13 +618,13 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                                     )}
 
                                     <div className="flex justify-between">
-                                        <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>封包:</span>
+                                        <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>Packets:</span>
                                         <span className={theme === 'dark' ? 'text-white' : 'text-gray-900'}>
                                             ↑{(session.packets_ul || 0).toLocaleString()} / ↓{(session.packets_dl || 0).toLocaleString()}
                                         </span>
                                     </div>
                                     <div className="flex justify-between">
-                                        <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>流量:</span>
+                                        <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>Traffic:</span>
                                         <span className={theme === 'dark' ? 'text-white' : 'text-gray-900'}>
                                             {formatBytes((session.bytes_ul || 0) + (session.bytes_dl || 0))}
                                         </span>
