@@ -86,17 +86,29 @@ type SessionInfo struct {
 	CreatedAt uint64
 }
 
+// PDRLookupEvent represents a PDR lookup result from kernel
+// This is emitted by fentry/fexit hooks on pdr_find_by_gtp1u and pdr_find_by_ipv4
+type PDRLookupEvent struct {
+	Timestamp  uint64
+	TEID       uint32
+	PDRFound   bool // true if PDR was found
+	Direction  uint8
+	LatencyNs  uint64
+}
+
 // Loader manages eBPF program loading and lifecycle
 type Loader struct {
 	objs         *upfMonitorObjects
 	links        []link.Link
 	reader       *ringbuf.Reader
 	packetReader *ringbuf.Reader
+	pdrReader    *ringbuf.Reader // Ring buffer for PDR lookup events
 	stopChan     chan struct{}
 
 	// Callbacks for events
-	OnDropEvent   func(event DropEvent)
-	OnPacketEvent func(event PacketEvent)
+	OnDropEvent      func(event DropEvent)
+	OnPacketEvent    func(event PacketEvent)
+	OnPDRLookupEvent func(event PDRLookupEvent)
 }
 
 // NewLoader creates a new eBPF loader
@@ -206,6 +218,15 @@ func (l *Loader) Load() error {
 		return fmt.Errorf("failed to create packet ring buffer reader: %w", err)
 	}
 
+	// Open ring buffer for PDR lookup events (from fentry/fexit hooks)
+	l.pdrReader, err = ringbuf.NewReader(l.objs.PdrEvents)
+	if err != nil {
+		log.Printf("Warning: failed to create PDR ring buffer reader: %v", err)
+		// Not fatal - may not be available if fentry not supported
+	} else {
+		log.Println("✓ Opened PDR lookup events ring buffer")
+	}
+
 	return nil
 }
 
@@ -213,6 +234,9 @@ func (l *Loader) Load() error {
 func (l *Loader) StartEventLoop() {
 	go l.readDropEvents()
 	go l.readPacketEvents()
+	if l.pdrReader != nil {
+		go l.readPDREvents()
+	}
 }
 
 func (l *Loader) readDropEvents() {
@@ -415,6 +439,10 @@ func (l *Loader) Close() {
 		l.packetReader.Close()
 	}
 
+	if l.pdrReader != nil {
+		l.pdrReader.Close()
+	}
+
 	for _, lnk := range l.links {
 		lnk.Close()
 	}
@@ -526,6 +554,44 @@ func (l *Loader) readPacketEvents() {
 
 		if l.OnPacketEvent != nil {
 			l.OnPacketEvent(event)
+		}
+	}
+}
+
+// readPDREvents reads PDR lookup events from the ring buffer
+func (l *Loader) readPDREvents() {
+	for {
+		select {
+		case <-l.stopChan:
+			return
+		default:
+		}
+
+		record, err := l.pdrReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			log.Printf("Error reading from PDR ring buffer: %v", err)
+			continue
+		}
+
+		// Parse PDR lookup event
+		// struct size: timestamp(8) + teid(4) + pdr_found(1) + direction(1) + pad(2) + latency(8) = 24 bytes
+		if len(record.RawSample) < 24 {
+			continue
+		}
+
+		event := PDRLookupEvent{
+			Timestamp:  binary.LittleEndian.Uint64(record.RawSample[0:8]),
+			TEID:       binary.LittleEndian.Uint32(record.RawSample[8:12]),
+			PDRFound:   record.RawSample[12] == 1,
+			Direction:  record.RawSample[13],
+			LatencyNs:  binary.LittleEndian.Uint64(record.RawSample[16:24]),
+		}
+
+		if l.OnPDRLookupEvent != nil {
+			l.OnPDRLookupEvent(event)
 		}
 	}
 }

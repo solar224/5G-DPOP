@@ -1,7 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import { SessionInfo, fetchSessions } from '../services/api';
 
-// 格式化 bytes
 function formatBytes(bytes: number): string {
     if (!bytes || bytes === 0) return '0 B';
     if (bytes < 1024) return `${bytes} B`;
@@ -10,7 +9,6 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-// 格式化 RFC3339 時間戳
 function formatTimestamp(ts: string | undefined): string {
     if (!ts) return 'N/A';
     try {
@@ -30,7 +28,6 @@ function formatTimestamp(ts: string | undefined): string {
     }
 }
 
-// Session 詳細資訊 Modal
 interface SessionDetailModalProps {
     session: SessionInfo;
     onClose: () => void;
@@ -40,7 +37,6 @@ interface SessionDetailModalProps {
 function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps) {
     const firstTeid = session.teids?.[0] || 'N/A';
 
-    // Theme variables
     const modalBg = theme === 'dark' ? 'bg-gray-800' : 'bg-white';
     const sectionBg = theme === 'dark' ? 'bg-gray-700/50' : 'bg-gray-100';
     const textPrimary = theme === 'dark' ? 'text-white' : 'text-gray-900';
@@ -51,7 +47,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
     return (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
             <div className={`${modalBg} rounded-xl shadow-2xl max-w-4xl w-full max-h-[90vh] overflow-y-auto`}>
-                {/* Header */}
                 <div className="bg-gradient-to-r from-cyan-600 to-blue-600 px-6 py-4 rounded-t-xl flex justify-between items-center sticky top-0">
                     <div>
                         <h2 className="text-xl font-bold text-white">PDU Session 詳細資訊</h2>
@@ -68,7 +63,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                 </div>
 
                 <div className="p-6 space-y-6">
-                    {/* 基本識別資訊 */}
                     <section>
                         <h3 className="text-lg font-semibold text-cyan-400 mb-3 flex items-center gap-2">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -104,7 +98,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </div>
                     </section>
 
-                    {/* 網路與 QoS 資訊 */}
                     <section>
                         <h3 className="text-lg font-semibold text-green-400 mb-3 flex items-center gap-2">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -128,7 +121,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </div>
                     </section>
 
-                    {/* 網路節點資訊 */}
                     <section>
                         <h3 className="text-lg font-semibold text-purple-400 mb-3 flex items-center gap-2">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -170,7 +162,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </div>
                     </section>
 
-                    {/* 頻寬限制 */}
                     {(session.mbr_ul_kbps || session.mbr_dl_kbps) && (
                         <section>
                             <h3 className="text-lg font-semibold text-orange-400 mb-3 flex items-center gap-2">
@@ -200,7 +191,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </section>
                     )}
 
-                    {/* 流量統計 */}
                     <section>
                         <h3 className="text-lg font-semibold text-yellow-400 mb-3 flex items-center gap-2">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -264,7 +254,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </div>
                     </section>
 
-                    {/* 時間與狀態資訊 */}
                     <section>
                         <h3 className="text-lg font-semibold text-red-400 mb-3 flex items-center gap-2">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -302,7 +291,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                         </div>
                     </section>
 
-                    {/* SEID ↔ TEID 關係圖 */}
                     <section>
                         <h3 className="text-lg font-semibold text-pink-400 mb-3 flex items-center gap-2">
                             <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -339,7 +327,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
                     </section>
                 </div>
 
-                {/* Footer */}
                 <div className={`${footerBg} px-6 py-4 rounded-b-xl border-t ${borderColor}`}>
                     <button
                         onClick={onClose}
@@ -353,7 +340,6 @@ function SessionDetailModal({ session, onClose, theme }: SessionDetailModalProps
     );
 }
 
-// 資訊卡片元件
 interface InfoCardProps {
     label: string;
     value: string;
@@ -378,7 +364,6 @@ function InfoCard({ label, value, icon, theme = 'dark' }: InfoCardProps) {
     );
 }
 
-// 統計卡片元件
 interface StatCardProps {
     label: string;
     value: string;
@@ -408,7 +393,6 @@ function StatCard({ label, value, icon, color = 'blue', theme = 'dark' }: StatCa
     );
 }
 
-// 主元件
 interface SessionTableProps {
     theme?: 'dark' | 'light'
 }
@@ -422,13 +406,19 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
     const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
     const [searchTerm, setSearchTerm] = useState('');
 
-    // 載入 Sessions
     useEffect(() => {
         const loadSessions = async () => {
             setIsLoading(true);
             try {
                 const result = await fetchSessions();
-                setSessions(result.sessions || []);
+                // Combine all session types so sessions don't disappear when becoming stale
+                const allSessions = [
+                    ...(result.sessions || []),
+                    ...(result.stale_sessions || []),
+                    ...(result.pending_sessions || []),
+                    ...(result.failed_sessions || []),
+                ];
+                setSessions(allSessions);
                 setError(null);
             } catch (err) {
                 setError('無法載入 PDU Sessions');
@@ -443,11 +433,9 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
         return () => clearInterval(interval);
     }, []);
 
-    // 過濾和排序
     const filteredAndSortedSessions = useMemo(() => {
         let result = [...sessions];
 
-        // 搜尋過濾
         if (searchTerm) {
             const term = searchTerm.toLowerCase();
             result = result.filter(s =>
@@ -459,7 +447,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
             );
         }
 
-        // 排序
         result.sort((a, b) => {
             let comparison = 0;
 
@@ -486,7 +473,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
         return result;
     }, [sessions, searchTerm, sortField, sortDirection]);
 
-    // 切換排序
     const toggleSort = (field: typeof sortField) => {
         if (sortField === field) {
             setSortDirection(d => d === 'asc' ? 'desc' : 'asc');
@@ -514,9 +500,7 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
 
     return (
         <div className="space-y-4">
-            {/* 工具列 */}
             <div className="flex flex-col sm:flex-row gap-4 justify-between items-start sm:items-center">
-                {/* 搜尋框 */}
                 <div className="relative flex-1 max-w-md">
                     <input
                         type="text"
@@ -538,7 +522,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                     </svg>
                 </div>
 
-                {/* 統計資訊 */}
                 <div className="flex gap-4 text-sm">
                     <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>
                         總共 <span className="text-cyan-400 font-bold">{sessions.length}</span> 個 Sessions
@@ -551,7 +534,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                 </div>
             </div>
 
-            {/* 排序按鈕 */}
             <div className="flex gap-2 flex-wrap">
                 {[
                     { field: 'created_at' as const, label: '建立時間' },
@@ -577,11 +559,10 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                 ))}
             </div>
 
-            {/* Session Cards */}
             {filteredAndSortedSessions.length === 0 ? (
                 <div className={`rounded-lg p-8 text-center ${theme === 'dark' ? 'bg-gray-800/50' : 'bg-gray-100'}`}>
                     <div className={`text-lg mb-2 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
-                        {searchTerm ? '🔍 沒有符合的 Sessions' : '📭 目前沒有活躍的 PDU Sessions'}
+                        {searchTerm ? '🔍 沒有符合的 Sessions' : '目前沒有活躍的 PDU Sessions'}
                     </div>
                     <p className={`text-sm ${theme === 'dark' ? 'text-gray-500' : 'text-gray-500'}`}>
                         {searchTerm
@@ -602,7 +583,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                                     : 'bg-white hover:bg-gray-50 border-gray-200'
                                     }`}
                             >
-                                {/* Card Header */}
                                 <div className="flex justify-between items-start mb-3">
                                     <div>
                                         <div className="text-cyan-400 font-bold text-lg">SEID: {session.seid}</div>
@@ -619,7 +599,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                                     </div>
                                 </div>
 
-                                {/* Card Body */}
                                 <div className="space-y-2 text-sm">
                                     <div className="flex justify-between">
                                         <span className={theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}>UE IP:</span>
@@ -652,7 +631,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                                     </div>
                                 </div>
 
-                                {/* Card Footer */}
                                 <div className={`mt-3 pt-3 border-t flex justify-between items-center ${theme === 'dark' ? 'border-gray-700' : 'border-gray-200'}`}>
                                     <span className={`text-xs ${theme === 'dark' ? 'text-gray-500' : 'text-gray-500'}`}>
                                         {session.duration || formatTimestamp(session.created_at)}
@@ -667,7 +645,6 @@ export default function SessionTable({ theme = 'dark' }: SessionTableProps) {
                 </div>
             )}
 
-            {/* Detail Modal */}
             {selectedSession && (
                 <SessionDetailModal
                     session={selectedSession}

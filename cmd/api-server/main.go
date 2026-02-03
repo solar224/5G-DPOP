@@ -104,9 +104,14 @@ type SessionInfo struct {
 	MBRDownlink uint64 `json:"mbr_dl_kbps,omitempty"`
 
 	// Status
-	Status     string `json:"status"`
-	Duration   string `json:"duration,omitempty"`
-	LastActive string `json:"last_active,omitempty"`
+	Status              string `json:"status"`
+	Duration            string `json:"duration,omitempty"`
+	LastActive          string `json:"last_active,omitempty"`
+	EstablishmentStatus string `json:"establishment_status,omitempty"` // Pending, Established, Failed
+
+	// Data Plane status (based on actual packet activity)
+	DataPlaneStatus string `json:"data_plane_status,omitempty"` // Active, Stale, Inactive
+	LastPacketTime  string `json:"last_packet_time,omitempty"`  // Last packet activity timestamp
 }
 
 // Server represents the API server
@@ -118,10 +123,13 @@ type Server struct {
 	broadcast chan interface{}
 
 	// In-memory stats (will be replaced with Prometheus queries)
-	stats    TrafficStats
-	drops    DropStats
-	sessions []SessionInfo
-	statsMu  sync.RWMutex
+	stats           TrafficStats
+	drops           DropStats
+	sessions        []SessionInfo // Active data plane sessions
+	staleSessions   []SessionInfo // Established but no recent traffic
+	failedSessions  []SessionInfo // Failed establishment sessions
+	pendingSessions []SessionInfo // Pending sessions (waiting for confirmation)
+	statsMu         sync.RWMutex
 }
 
 func main() {
@@ -152,7 +160,10 @@ func NewServer() *Server {
 			RecentDrops: make([]DropEvent, 0),
 			ByReason:    make(map[string]uint64),
 		},
-		sessions: make([]SessionInfo, 0),
+		sessions:        make([]SessionInfo, 0),
+		staleSessions:   make([]SessionInfo, 0),
+		failedSessions:  make([]SessionInfo, 0),
+		pendingSessions: make([]SessionInfo, 0),
 	}
 
 	s.setupRoutes()
@@ -227,8 +238,18 @@ func (s *Server) handleSessions(c *gin.Context) {
 	defer s.statsMu.RUnlock()
 
 	c.JSON(http.StatusOK, gin.H{
-		"total":    len(s.sessions),
-		"sessions": s.sessions,
+		"total":            len(s.sessions), // Only count data plane active sessions
+		"sessions":         s.sessions,      // Data plane active sessions
+		"stale_sessions":   s.staleSessions, // Established but no recent traffic
+		"failed_sessions":  s.failedSessions,
+		"pending_sessions": s.pendingSessions,
+		"total_all":        len(s.sessions) + len(s.staleSessions) + len(s.failedSessions) + len(s.pendingSessions),
+		"counts": gin.H{
+			"active":  len(s.sessions),
+			"stale":   len(s.staleSessions),
+			"failed":  len(s.failedSessions),
+			"pending": len(s.pendingSessions),
+		},
 	})
 }
 
@@ -503,9 +524,12 @@ func (s *Server) collectMetricsFromAgent() {
 			s.drops = *dropsData
 		}
 
-		// Update sessions from agent API
+		// Update sessions from agent API (separated by status)
 		if sessionsData != nil {
-			s.sessions = sessionsData
+			s.sessions = sessionsData.Sessions
+			s.staleSessions = sessionsData.StaleSessions
+			s.failedSessions = sessionsData.FailedSessions
+			s.pendingSessions = sessionsData.PendingSessions
 		}
 		s.statsMu.Unlock()
 	}
@@ -527,23 +551,29 @@ func (s *Server) fetchAgentDrops() (*DropStats, error) {
 	return &dropsData, nil
 }
 
+// SessionsResponse holds the full sessions response from agent
+type SessionsResponse struct {
+	Total           int           `json:"total"`
+	Sessions        []SessionInfo `json:"sessions"`
+	StaleSessions   []SessionInfo `json:"stale_sessions"`
+	FailedSessions  []SessionInfo `json:"failed_sessions"`
+	PendingSessions []SessionInfo `json:"pending_sessions"`
+}
+
 // fetchAgentSessions fetches sessions from agent API
-func (s *Server) fetchAgentSessions() ([]SessionInfo, error) {
+func (s *Server) fetchAgentSessions() (*SessionsResponse, error) {
 	resp, err := http.Get(agentSessionsURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch sessions: %w", err)
 	}
 	defer resp.Body.Close()
 
-	var result struct {
-		Total    int           `json:"total"`
-		Sessions []SessionInfo `json:"sessions"`
-	}
+	var result SessionsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("failed to decode sessions: %w", err)
 	}
 
-	return result.Sessions, nil
+	return &result, nil
 }
 
 // agentMetrics holds parsed metrics from the agent
@@ -721,6 +751,11 @@ func hasActiveFlowToN9Peer(session SessionInfo) bool {
 			return true
 		}
 	}
+	// Fallback: If no flow tracking data but this is a ULCL session,
+	// assume Internet traffic goes through N9 to PSA-UPF
+	if len(session.FlowTraffic) == 0 && session.N9PeerIP != "" {
+		return isSessionActive(session)
+	}
 	return false
 }
 
@@ -736,10 +771,11 @@ func hasActiveFlowToLocalBreakout(session SessionInfo) bool {
 		}
 	}
 	// If no flow tracking data and this is a ULCL session (has N9PeerIP),
-	// we can't determine if it's local breakout - return true for I-UPF N6
-	// since all traffic goes through I-UPF first
+	// we can't determine if it's local breakout
+	// DEFAULT: Assume Internet traffic (via N9), NOT local breakout
+	// I-UPF N6 should NOT light up without explicit local breakout flow data
 	if len(session.FlowTraffic) == 0 && session.N9PeerIP != "" {
-		return isSessionActive(session)
+		return false // Changed: no fallback for ULCL - assume Internet traffic
 	}
 	// For non-ULCL sessions, fall back to session-level activity
 	if len(session.FlowTraffic) == 0 && session.N9PeerIP == "" {
@@ -783,9 +819,16 @@ func (s *Server) handleTopology(c *gin.Context) {
 		lastSeen    string
 	})
 
+	// Combine all session types for topology visualization
+	// In ULCL, we need to show the network structure even if sessions are stale
+	allSessions := make([]SessionInfo, 0, len(s.sessions)+len(s.staleSessions)+len(s.pendingSessions))
+	allSessions = append(allSessions, s.sessions...)
+	allSessions = append(allSessions, s.staleSessions...)
+	allSessions = append(allSessions, s.pendingSessions...)
+
 	// First, identify all UPFs from N9PeerIP (these are definitely UPFs)
 	upfIPs := make(map[string]bool)
-	for _, session := range s.sessions {
+	for _, session := range allSessions {
 		if session.UPFIP != "" {
 			upfIPs[session.UPFIP] = true
 		}
@@ -796,13 +839,13 @@ func (s *Server) handleTopology(c *gin.Context) {
 	}
 
 	// Pass 1: Create all nodes
-	for _, session := range s.sessions {
+	for _, session := range allSessions {
 		// UE Node
 		if session.UEIP != "" {
 			nodes[session.UEIP] = TopologyNode{
 				ID:    session.UEIP,
 				Type:  "ue",
-				Label: "UE " + session.UEIP,
+				Label: "UE",
 				IP:    session.UEIP,
 			}
 		}
@@ -812,19 +855,21 @@ func (s *Server) handleTopology(c *gin.Context) {
 		if upfIP == "" {
 			upfIP = "UPF-Local"
 		}
+		// PSA-UPF is the UPF where we captured PFCP (upfIP)
 		nodes[upfIP] = TopologyNode{
 			ID:    upfIP,
 			Type:  "upf",
-			Label: "UPF " + upfIP,
+			Label: "PSA-UPF",
 			IP:    upfIP,
 		}
 
 		// N9 Peer UPF (definitely a UPF in ULCL)
+		// I-UPF is the N9 peer (intermediate UPF that receives from gNB)
 		if session.N9PeerIP != "" {
 			nodes[session.N9PeerIP] = TopologyNode{
 				ID:    session.N9PeerIP,
 				Type:  "upf",
-				Label: "UPF " + session.N9PeerIP,
+				Label: "I-UPF",
 				IP:    session.N9PeerIP,
 			}
 		}
@@ -840,7 +885,7 @@ func (s *Server) handleTopology(c *gin.Context) {
 				nodes[uplinkPeer] = TopologyNode{
 					ID:    uplinkPeer,
 					Type:  "gnb",
-					Label: "gNB " + uplinkPeer,
+					Label: "gNB",
 					IP:    uplinkPeer,
 				}
 			}
@@ -852,7 +897,7 @@ func (s *Server) handleTopology(c *gin.Context) {
 				nodes[session.GNBIP] = TopologyNode{
 					ID:    session.GNBIP,
 					Type:  "gnb",
-					Label: "gNB " + session.GNBIP,
+					Label: "gNB",
 					IP:    session.GNBIP,
 				}
 			}
@@ -860,7 +905,7 @@ func (s *Server) handleTopology(c *gin.Context) {
 	}
 
 	// Pass 2: Calculate traffic activity for each session's links
-	for _, session := range s.sessions {
+	for _, session := range allSessions {
 		upfIP := session.UPFIP
 		if upfIP == "" {
 			upfIP = "UPF-Local"
@@ -872,14 +917,19 @@ func (s *Server) handleTopology(c *gin.Context) {
 		// Determine gNB (the actual radio access point)
 		gnbIP := session.GNBIP
 
-		// Determine I-UPF (intermediate UPF in ULCL)
-		// In ULCL: gNB -> I-UPF -> PSA-UPF -> DN
-		// UplinkPeerIP from PSA-UPF's perspective is I-UPF
+		// ULCL Path Understanding (from PFCP sniffer perspective):
+		// - We are monitoring PFCP at PSA-UPF (the anchor UPF)
+		// - upf_ip (session.UPFIP) = PSA-UPF (10.100.200.2, receives N9 from I-UPF)
+		// - n9_peer_ip = I-UPF (10.100.200.3, the N9 peer from PSA's perspective)
+		// Actual Path: gNB -> I-UPF (n9_peer_ip) -> PSA-UPF (upf_ip) -> DN
+		
+		// PSA-UPF is where we captured the PFCP
+		psaUpfIP := upfIP
+		
+		// I-UPF is the N9 peer (intermediate UPF that receives from gNB)
 		iUpfIP := ""
 		if session.N9PeerIP != "" && session.N9PeerIP != upfIP {
 			iUpfIP = session.N9PeerIP
-		} else if session.UplinkPeerIP != "" && upfIPs[session.UplinkPeerIP] {
-			iUpfIP = session.UplinkPeerIP
 		}
 
 		// Link: UE -> gNB (Radio)
@@ -898,13 +948,9 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// Link: gNB -> I-UPF (N3) or gNB -> UPF (N3 if no ULCL)
-		if gnbIP != "" {
-			targetUPF := upfIP
-			if iUpfIP != "" {
-				targetUPF = iUpfIP
-			}
-			linkKey := gnbIP + "->" + targetUPF
+		// Link: gNB -> I-UPF (N3) - gNB always connects to I-UPF
+		if gnbIP != "" && iUpfIP != "" {
+			linkKey := gnbIP + "->" + iUpfIP
 			if existing, ok := activeLinkTraffic[linkKey]; !ok || sessionActive {
 				activeLinkTraffic[linkKey] = struct {
 					active      bool
@@ -918,9 +964,9 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// Link: I-UPF -> PSA-UPF (N9) - only in ULCL
-		if iUpfIP != "" && iUpfIP != upfIP {
-			linkKey := iUpfIP + "->" + upfIP
+		// Link: I-UPF -> PSA-UPF (N9) - only in ULCL when PSA exists
+		if psaUpfIP != "" && iUpfIP != "" && psaUpfIP != iUpfIP {
+			linkKey := iUpfIP + "->" + psaUpfIP
 			if existing, ok := activeLinkTraffic[linkKey]; !ok || sessionActive {
 				activeLinkTraffic[linkKey] = struct {
 					active      bool
@@ -938,7 +984,7 @@ func (s *Server) handleTopology(c *gin.Context) {
 	// Pass 3: Create links with activity information
 	linkSet := make(map[string]bool)
 
-	for _, session := range s.sessions {
+	for _, session := range allSessions {
 		upfIP := session.UPFIP
 		if upfIP == "" {
 			upfIP = "UPF-Local"
@@ -947,12 +993,11 @@ func (s *Server) handleTopology(c *gin.Context) {
 		sessionActive := isSessionActive(session)
 		gnbIP := session.GNBIP
 
-		// Determine I-UPF
+		// ULCL Path (from PFCP sniffer at PSA-UPF): upfIP is PSA-UPF, n9_peer_ip is I-UPF
+		psaUpfIP := upfIP
 		iUpfIP := ""
 		if session.N9PeerIP != "" && session.N9PeerIP != upfIP {
 			iUpfIP = session.N9PeerIP
-		} else if session.UplinkPeerIP != "" && upfIPs[session.UplinkPeerIP] {
-			iUpfIP = session.UplinkPeerIP
 		}
 
 		// Radio Link: UE -> gNB
@@ -973,19 +1018,15 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// N3 Link: gNB -> I-UPF (or gNB -> UPF if no ULCL)
-		if gnbIP != "" {
-			targetUPF := upfIP
-			if iUpfIP != "" {
-				targetUPF = iUpfIP
-			}
-			linkKey := gnbIP + "->" + targetUPF
+		// N3 Link: gNB -> I-UPF
+		if gnbIP != "" && iUpfIP != "" {
+			linkKey := gnbIP + "->" + iUpfIP
 			if !linkSet[linkKey] {
 				linkSet[linkKey] = true
 				activity := activeLinkTraffic[linkKey]
 				links = append(links, TopologyLink{
 					Source:           gnbIP,
-					Target:           targetUPF,
+					Target:           iUpfIP,
 					Label:            "N3",
 					Type:             "n3",
 					HasActiveTraffic: activity.active || sessionActive,
@@ -995,24 +1036,24 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// N9 Link: I-UPF -> PSA-UPF (only in ULCL)
-		// This link is active only when there's traffic going through N9 to PSA
-		if iUpfIP != "" && iUpfIP != upfIP {
-			linkKey := iUpfIP + "->" + upfIP
+		// N9 Link: I-UPF -> PSA-UPF (only in ULCL when PSA exists)
+		if psaUpfIP != "" && iUpfIP != "" && psaUpfIP != iUpfIP {
+			linkKey := iUpfIP + "->" + psaUpfIP
 			if !linkSet[linkKey] {
 				linkSet[linkKey] = true
 				activity := activeLinkTraffic[linkKey]
 
 				// Use per-flow tracking to determine N9 activity
-				// Without per-flow data, N9 should NOT be active by default
-				// because we can't distinguish local breakout from anchor traffic
+				// Without per-flow data, use session activity as fallback for ULCL
 				n9Active := hasActiveFlowToN9Peer(session)
-				// Note: NO fallback - if no flow data, N9 stays inactive
-				// This prevents all paths from lighting up when we can't track flows
+				if !n9Active && sessionActive {
+					// Fallback: if session is active in ULCL, N9 is likely active
+					n9Active = true
+				}
 
 				links = append(links, TopologyLink{
 					Source:           iUpfIP,
-					Target:           upfIP,
+					Target:           psaUpfIP,
 					Label:            "N9",
 					Type:             "n9",
 					HasActiveTraffic: n9Active,
@@ -1042,7 +1083,7 @@ func (s *Server) handleTopology(c *gin.Context) {
 	upfN9Activity := make(map[string]bool)    // For PSA-UPF (traffic via N9)
 	upfTrafficRate := make(map[string]float64)
 
-	for _, session := range s.sessions {
+	for _, session := range allSessions {
 		upfIP := session.UPFIP
 		if upfIP == "" {
 			upfIP = "UPF-Local"

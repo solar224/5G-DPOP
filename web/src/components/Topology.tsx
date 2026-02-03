@@ -27,12 +27,10 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         }
 
         loadTopology()
-        // Refresh every 5 seconds
         const interval = setInterval(loadTopology, 5000)
         return () => clearInterval(interval)
     }, [])
 
-    // Theme-based colors
     const isDark = theme === 'dark'
     const textColor = isDark ? '#e2e8f0' : '#1e293b'
     const subTextColor = isDark ? '#94a3b8' : '#64748b'
@@ -51,19 +49,19 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         return <div className="text-center py-10 text-slate-500">No topology data available</div>
     }
 
-    // Group nodes by type
     const nodesByType: Record<string, TopologyNode[]> = {
         'ue': [], 'gnb': [], 'upf': [], 'dn': []
     }
     topology.nodes.forEach(n => {
         if (nodesByType[n.type]) nodesByType[n.type].push(n)
     })
+    Object.keys(nodesByType).forEach(type => {
+        nodesByType[type].sort((a, b) => a.id.localeCompare(b.id))
+    })
 
-    // Layout configuration
     const width = 800
     const padding = 30
 
-    // Dynamic height based on node count to prevent overlapping
     const maxNodes = Math.max(...Object.values(nodesByType).map(n => n.length))
     const minHeight = 350
     const height = Math.max(minHeight, maxNodes * 120 + padding * 2)
@@ -76,7 +74,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         'dn': width * 0.9
     }
 
-    // Calculate positions
     const nodePositions: Record<string, { x: number, y: number }> = {}
 
     Object.entries(nodesByType).forEach(([type, nodes]) => {
@@ -92,7 +89,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         })
     })
 
-    // Helper to get icon component
     const getIcon = (type: string, props: any) => {
         switch (type) {
             case 'ue': return <Smartphone {...props} />
@@ -103,13 +99,12 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         }
     }
 
-    // Helper to get node color
     const getColor = (type: string) => {
         switch (type) {
-            case 'ue': return '#22c55e' // green-500
-            case 'gnb': return '#06b6d4' // cyan-500
-            case 'upf': return '#3b82f6' // blue-500
-            case 'dn': return '#a855f7' // purple-500
+            case 'ue': return '#22c55e'
+            case 'gnb': return '#06b6d4'
+            case 'upf': return '#3b82f6'
+            case 'dn': return '#a855f7'
             default: return '#64748b'
         }
     }
@@ -173,18 +168,15 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                         </marker>
                     </defs>
 
-                    {/* Links */}
                     {topology.links.map((link, idx) => {
                         const start = nodePositions[link.source]
                         const end = nodePositions[link.target]
                         if (!start || !end) return null
 
-                        // Check if this link has active traffic
                         const hasTraffic = link.hasActiveTraffic === true
 
                         return (
                             <g key={`${link.source}-${link.target}-${idx}`}>
-                                {/* Base link line */}
                                 <line
                                     x1={start.x}
                                     y1={start.y}
@@ -197,7 +189,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                     opacity={hasTraffic ? 1 : 0.5}
                                     className="transition-all duration-500"
                                 />
-                                {/* Traffic Animation - Only show when there's active traffic */}
                                 {hasTraffic && (
                                     <circle r="4" fill={trafficColor}>
                                         <animate
@@ -223,7 +214,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                         />
                                     </circle>
                                 )}
-                                {/* Traffic glow effect for active links */}
                                 {hasTraffic && (
                                     <line
                                         x1={start.x}
@@ -237,31 +227,46 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                         filter="blur(3px)"
                                     />
                                 )}
-                                {/* Label */}
                                 <text
                                     x={(start.x + end.x) / 2}
-                                    y={(start.y + end.y) / 2 - 5}
+                                    y={(start.y + end.y) / 2 - 8}
                                     textAnchor="middle"
                                     fill={hasTraffic ? trafficColor : subTextColor}
-                                    fontSize="10"
+                                    fontSize="11"
                                     fontWeight={hasTraffic ? "bold" : "normal"}
                                 >
                                     {link.label || link.type.toUpperCase()}
                                 </text>
+                                {/* Show traffic rate when active */}
+                                {(link.trafficRate ?? 0) > 0 && (
+                                    <text
+                                        x={(start.x + end.x) / 2}
+                                        y={(start.y + end.y) / 2 + 6}
+                                        textAnchor="middle"
+                                        fill={hasTraffic ? trafficColor : subTextColor}
+                                        fontSize="9"
+                                        fontFamily="monospace"
+                                    >
+                                        {/* trafficRate is in bytes/sec, convert to appropriate unit */}
+                                        {(link.trafficRate ?? 0) >= 1024 * 1024
+                                            ? `${((link.trafficRate ?? 0) / 1024 / 1024).toFixed(1)} MB/s`
+                                            : (link.trafficRate ?? 0) >= 1024
+                                                ? `${((link.trafficRate ?? 0) / 1024).toFixed(1)} KB/s`
+                                                : `${(link.trafficRate ?? 0).toFixed(0)} B/s`}
+                                    </text>
+                                )}
                             </g>
                         )
                     })}
 
-                    {/* Nodes */}
                     {topology.nodes.map((node) => {
                         const pos = nodePositions[node.id]
                         if (!pos) return null
                         let color = getColor(node.type)
 
-                        // Check for drops on UPF
                         const isUpfWithDrops = node.type === 'upf' && drops.total > 0
                         if (isUpfWithDrops) {
-                            color = '#ef4444' // red-500
+                            color = '#ef4444'
                         }
 
                         return (
@@ -276,7 +281,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                 onMouseLeave={() => setHoveredNode(null)}
                                 className="cursor-pointer"
                             >
-                                {/* Drop Alert Pulse */}
                                 {isUpfWithDrops && (
                                     <circle r="24" fill="none" stroke="#ef4444" strokeWidth="2" opacity="0.5">
                                         <animate attributeName="r" from="24" to="34" dur="1s" repeatCount="indefinite" />
@@ -284,7 +288,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                     </circle>
                                 )}
 
-                                {/* Node Circle */}
                                 <circle
                                     r="24"
                                     fill={nodeBg}
@@ -293,41 +296,122 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                     className="transition-all duration-300"
                                 />
 
-                                {/* Icon - Centered */}
                                 <g transform="translate(-12, -12)">
                                     {getIcon(node.type, { size: 24, color: color })}
                                 </g>
 
-                                {/* Label */}
                                 <text
                                     x="0"
                                     y="35"
                                     textAnchor="middle"
                                     fill={textColor}
-                                    fontSize="12"
+                                    fontSize="13"
                                     fontWeight="bold"
                                 >
                                     {node.label}
                                 </text>
-                                {/* IP Address */}
-                                {node.ip && (
+                                {/* Show IP only if different from label and type is not DN */}
+                                {node.ip && node.type !== 'dn' && (
                                     <text
                                         x="0"
                                         y="48"
                                         textAnchor="middle"
                                         fill={subTextColor}
-                                        fontSize="10"
+                                        fontSize="9"
                                         fontFamily="monospace"
                                     >
                                         {node.ip}
                                     </text>
+                                )}
+                                {/* Data Plane Verification Badge */}
+                                {node.verified !== undefined && (
+                                    <g transform="translate(18, -18)">
+                                        <circle
+                                            r="8"
+                                            fill={node.verified ? '#22c55e' : '#f59e0b'}
+                                            stroke={isDark ? '#1e293b' : '#ffffff'}
+                                            strokeWidth="2"
+                                        />
+                                        <text
+                                            x="0"
+                                            y="3"
+                                            textAnchor="middle"
+                                            fill="white"
+                                            fontSize="9"
+                                            fontWeight="bold"
+                                        >
+                                            {node.verified ? '✓' : '?'}
+                                        </text>
+                                    </g>
+                                )}
+                                {/* Data Plane Status Indicator */}
+                                {node.dataPlaneStatus === 'active' && (
+                                    <g transform="translate(-18, -18)">
+                                        <circle r="6" fill="#22c55e">
+                                            <animate attributeName="opacity" values="1;0.5;1" dur="2s" repeatCount="indefinite" />
+                                        </circle>
+                                    </g>
+                                )}
+                                {node.dataPlaneStatus === 'stale' && (
+                                    <g transform="translate(-18, -18)">
+                                        <circle r="6" fill="#f59e0b" />
+                                    </g>
+                                )}
+                                {/* Session Count Badge for UPF */}
+                                {node.type === 'upf' && sessions.length > 0 && (
+                                    <g transform="translate(20, 15)">
+                                        <rect
+                                            x="-12"
+                                            y="-8"
+                                            width="24"
+                                            height="16"
+                                            rx="4"
+                                            fill="#3b82f6"
+                                            stroke={isDark ? '#1e293b' : '#ffffff'}
+                                            strokeWidth="1"
+                                        />
+                                        <text
+                                            x="0"
+                                            y="4"
+                                            textAnchor="middle"
+                                            fill="white"
+                                            fontSize="10"
+                                            fontWeight="bold"
+                                        >
+                                            {sessions.length}
+                                        </text>
+                                    </g>
+                                )}
+                                {/* Connected UE Count Badge for gNB */}
+                                {node.type === 'gnb' && (
+                                    <g transform="translate(20, 15)">
+                                        <rect
+                                            x="-12"
+                                            y="-8"
+                                            width="24"
+                                            height="16"
+                                            rx="4"
+                                            fill="#8b5cf6"
+                                            stroke={isDark ? '#1e293b' : '#ffffff'}
+                                            strokeWidth="1"
+                                        />
+                                        <text
+                                            x="0"
+                                            y="4"
+                                            textAnchor="middle"
+                                            fill="white"
+                                            fontSize="10"
+                                            fontWeight="bold"
+                                        >
+                                            {sessions.filter(s => s.gnb_ip === node.ip).length}
+                                        </text>
+                                    </g>
                                 )}
                             </g>
                         )
                     })}
                 </svg>
 
-                {/* Tooltip */}
                 {hoveredNode && (
                     <div
                         className={`fixed z-50 p-4 rounded-lg shadow-xl border ${tooltipBg} ${tooltipBorder} pointer-events-none`}
@@ -349,7 +433,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                     </div>
                 )}
 
-                {/* Legend */}
                 <div className={`absolute bottom-4 right-4 p-3 rounded-lg border text-xs ${isDark ? 'bg-slate-800/80 border-slate-700' : 'bg-white/80 border-gray-200'
                     }`}>
                     <div className={`font-semibold mb-2 ${isDark ? 'text-slate-300' : 'text-gray-700'}`}>Legend</div>

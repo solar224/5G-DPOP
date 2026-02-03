@@ -1,90 +1,74 @@
 # 5G-DPOP: 5G UPF Data Plane Observability Platform
 
-A non-intrusive 5G Core Network User Plane observability platform based on **eBPF** technology. This project leverages Linux eBPF kprobe mechanisms to directly hook `gtp5g` kernel module functions, enabling real-time traffic monitoring, packet drop detection, and PFCP session correlation analysis for free5GC UPF, without modifying any free5GC or gtp5g source code.
+A 5G Core Network User Plane observability platform based on eBPF technology. This project leverages Linux eBPF kprobe mechanisms to directly hook `gtp5g` kernel module functions, enabling real-time traffic monitoring, packet drop detection, and PFCP session correlation analysis.
 
----
-
-### Component Description
+## System Architecture
 
 | Component | Technology | Function | Port |
 |-----------|------------|----------|------|
-| **eBPF Agent** | Go + cilium/ebpf | Load eBPF programs, read kernel maps, export metrics | 9100 (Prometheus) |
-| **PFCP Sniffer** | Go + gopacket | Listen to PFCP messages, parse sessions, build TEID mappings | 8805 (listen) |
-| **API Server** | Go + Gin | REST API + WebSocket real-time streaming | 8080 |
-| **Web Frontend** | React + TypeScript + Vite | Visualization dashboard | 3000 (dev) |
-| **Prometheus** | Docker | Time-series database, metrics storage | 9090 |
-| **Otel Collector** | Docker | OpenTelemetry collector | 4317 |
-
----
+| eBPF Agent | Go + cilium/ebpf | Load eBPF programs, read kernel maps, export metrics | 9100 |
+| PFCP Sniffer | Go + gopacket | Listen to PFCP messages, parse sessions, build TEID mappings | 8805 |
+| API Server | Go + Gin | REST API + WebSocket real-time streaming | 8080 |
+| Web Frontend | React + TypeScript + Vite | Visualization dashboard | 3000 |
+| Prometheus | Docker | Time-series database, metrics storage | 9090 |
+| Otel Collector | Docker | OpenTelemetry collector | 4317 |
 
 ## Requirements
 
-### Hardware Requirements
-
-| Item | Minimum | Recommended |
-|------|---------|-------------|
-| CPU | 2 cores | 4+ cores |
-| RAM | 4 GB | 8+ GB |
-| Disk | 20 GB | 50+ GB SSD |
-| Network | 1 Gbps | 1 Gbps |
+### Operating System
+- Ubuntu 25.04 (Kernel 6.14+ with BTF support)
 
 ### Software Requirements
+| Software | Version | Purpose |
+|----------|---------|---------|
+| Go | 1.21+ | Compile Agent and API Server |
+| Node.js | 18+ LTS | Build Web Frontend |
+| Docker | 24+ | Run Observability Stack |
+| Docker Compose | v2+ | Container orchestration |
+| Clang/LLVM | 14+ | Compile eBPF programs |
+| bpftool | Latest | Generate vmlinux.h |
 
-| Software | Version | Description |
-|----------|---------|-------------|
-| **OS** | Ubuntu 25.04 (Plucky Puffin) | Requires Kernel 6.14+ with BTF support |
-| **Linux Kernel** | 6.14.0-36-generic | CONFIG_BPF, CONFIG_BTF must be enabled |
-| **Go** | 1.21+ | Compile Agent and API Server |
-| **Node.js** | 18+ LTS | Build frontend |
-| **Docker** | 24+ | Run Observability Stack |
-| **Docker Compose** | v2+ | Container orchestration |
-| **Clang/LLVM** | 14+ | Compile eBPF C programs |
-| **libbpf** | 1.0+ | eBPF library |
-| **bpftool** | Latest | Generate vmlinux.h |
+### Prerequisites
+- free5GC v4.1.0 or free5gc-compose environment ready
+- gtp5g kernel module loaded
 
-### free5GC Environment
-
-| Component | Version | Status |
-|-----------|---------|--------|
-| **free5GC** | v4.1.0 | Running in host mode |
-| **gtp5g** | Latest | Must be compiled for current kernel |
-| **UERANSIM** | Latest | Running on VM2 |
-
-### Verify eBPF Support
-
-Run the following commands to verify eBPF support:
+### Verify Environment
 
 ```bash
 # Check BTF support
 ls -la /sys/kernel/btf/vmlinux
 
-# Check gtp5g module is loaded
+# Check gtp5g module
 lsmod | grep gtp5g
+# Expected output: gtp5g   159744  0
 
 # Verify hookable symbols exist
 sudo cat /proc/kallsyms | grep gtp5g_encap_recv
 sudo cat /proc/kallsyms | grep gtp5g_dev_xmit
+# Expected output:
+# ffffffffc11a7aa0 t gtp5g_encap_recv     [gtp5g]
+# ffffffffc11a6420 t gtp5g_dev_xmit       [gtp5g]
 ```
 
-Expected output:
-```
-ffffffffc11a7aa0 t gtp5g_encap_recv     [gtp5g]
-ffffffffc11a6420 t gtp5g_dev_xmit       [gtp5g]
-```
+## Quick Start
 
----
+### Important: Startup Order
 
-## Usage Guide
+**You must start 5G-DPOP before starting free5GC**. 5G-DPOP needs to capture PFCP Session Establishment messages during UE registration to correctly build Session and Topology information.
 
-### Step 1: Environment Setup
+### Step 1: Install Dependencies
 
-#### 1.1 Install System Dependencies
-
+Option 1: Use one-click setup script
 ```bash
-# Update package list
-sudo apt-get update
+cd ~/5G-DPOP
+chmod +x scripts/setup_env.sh
+./scripts/setup_env.sh
+```
 
+Option 2: Manual installation
+```bash
 # Install build tools and eBPF development dependencies
+sudo apt-get update
 sudo apt-get install -y \
     build-essential \
     clang \
@@ -94,151 +78,34 @@ sudo apt-get install -y \
     libelf-dev \
     libpcap-dev \
     pkg-config \
-    bpftool \
-    bpftrace
+    bpftool
 ```
-
-#### 1.2 Install Go
-
-```bash
-# Download Go 1.21+
-wget https://go.dev/dl/go1.21.5.linux-amd64.tar.gz
-
-# Extract to /usr/local
-sudo rm -rf /usr/local/go
-sudo tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz
-
-# Set environment variables (add to ~/.bashrc)
-echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-echo 'export PATH=$PATH:$(go env GOPATH)/bin' >> ~/.bashrc
-source ~/.bashrc
-
-# Verify installation
-go version
-# Output: go version go1.21.5 linux/amd64
-```
-
-#### 1.3 Install Node.js
-
-```bash
-# Install Node.js 18 LTS using NodeSource
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-sudo apt-get install -y nodejs
-
-# Verify installation
-node -v  # v18.x.x
-npm -v   # 9.x.x
-```
-
-#### 1.4 Install Docker
-
-```bash
-# Install Docker using official script
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-
-# Add current user to docker group
-sudo usermod -aG docker $USER
-
-# Re-login or run
-newgrp docker
-
-# Verify installation
-docker --version
-docker compose version
-```
-
-#### 1.5 Verify gtp5g Module
-
-```bash
-# If gtp5g is not loaded, compile and load it first
-cd ~/gtp5g
-
-# Recompile for current kernel
-make clean
-make
-
-# Load module
-sudo insmod gtp5g.ko
-
-# Verify loaded successfully
-lsmod | grep gtp5g
-# Output: gtp5g    159744  1
-```
-
----
 
 ### Step 2: Build Project
 
-#### 2.1 Get the Project
-
 ```bash
-cd ~
-# Clone the project if not already done
-git clone https://github.com/solar224/5G-DPOP.git
-cd 5G-DPOP
-
-# If project exists, ensure you're in the correct directory
 cd ~/5G-DPOP
-```
 
-#### 2.2 Run Environment Setup Script
-
-```bash
-# Run one-click setup script (optional, auto-installs all dependencies)
-chmod +x scripts/setup_env.sh
-./scripts/setup_env.sh
-```
-
-#### 2.3 Generate vmlinux.h
-
-```bash
-# Generate BTF type definitions from running kernel
+# Generate vmlinux.h (required for first build)
 sudo bpftool btf dump file /sys/kernel/btf/vmlinux format c > internal/ebpf/bpf/vmlinux.h
-```
 
-#### 2.4 Compile eBPF Program
+# Compile eBPF programs and Go binaries
+make all
 
-```bash
-# Compile eBPF C program to .o file
-make ebpf
-
-# Output:
-# clang -O2 -g -Wall -target bpf -D__TARGET_ARCH_x86 -c internal/ebpf/bpf/upf_monitor.bpf.c -o internal/ebpf/bpf/upf_monitor.bpf.o
-```
-
-#### 2.5 Compile Go Programs
-
-```bash
-# Download Go dependencies
-make deps
-
-# Build all Go binaries
-make build
-
-# Output:
+# Expected output:
+# clang -O2 -g -Wall -target bpf ... -o internal/ebpf/bpf/upf_monitor.bpf.o
 # go build -o bin/agent ./cmd/agent
 # go build -o bin/api-server ./cmd/api-server
 
 # Verify build results
 ls -la bin/
-# -rwxrwxr-x 1 user user 16M Nov 29 10:00 agent
-# -rwxrwxr-x 1 user user 13M Nov 29 10:00 api-server
+# Should see agent and api-server executables
+
+# Install Web frontend dependencies
+cd web && npm install && cd ..
 ```
-
-#### 2.6 Install Frontend Dependencies
-
-```bash
-cd web
-npm install
-cd ..
-```
-
----
 
 ### Step 3: Start Observability Stack
-
-#### 3.1 Start Docker Compose
 
 ```bash
 # Start Prometheus + Otel Collector + Redis
@@ -246,37 +113,20 @@ docker compose -f deployments/docker-compose.yaml up -d
 
 # Check container status
 docker compose -f deployments/docker-compose.yaml ps
+# Expected: prometheus, otel-collector, redis all in running state
 
-# Expected output:
-# NAME                COMMAND                  SERVICE             STATUS
-# prometheus          "/bin/prometheus..."     prometheus          running
-# otel-collector      "/otelcol-contrib..."    otel-collector      running
-# redis               "docker-entrypoint..."   redis               running
-```
-
-#### 3.2 Verify Services
-
-```bash
-# Check Prometheus
+# Verify Prometheus
 curl http://localhost:9090/-/healthy
-# Output: Prometheus Server is Healthy.
-
-# Check Otel Collector health
-curl http://localhost:13133
-# Output: {"status":"Server available","upSince":"...","uptime":"..."}
+# Expected output: Prometheus Server is Healthy.
 ```
 
----
+### Step 4: Start 5G-DPOP Services
 
-### Step 4: Start 5G-DPOP Platform
+You need to open three terminals:
 
-#### 4.1 Start eBPF Agent (Requires Root)
-
+**Terminal 1 - Agent (requires root privileges)**
 ```bash
-# Open a new terminal
 cd ~/5G-DPOP
-
-# Run Agent with root privileges
 sudo ./bin/agent
 
 # Expected output:
@@ -286,33 +136,11 @@ sudo ./bin/agent
 # [OK] eBPF programs loaded successfully
 # [OK] Event loop started
 # [INFO] Prometheus metrics server listening on :9100
-# [INFO] Agent is running. Press Ctrl+C to stop.
 ```
 
-#### 4.2 Verify Agent Operation
-
+**Terminal 2 - API Server**
 ```bash
-# Check health endpoint
-curl http://localhost:9100/health
-# Output: OK
-
-# Check Prometheus metrics
-curl http://localhost:9100/metrics | grep upf_
-# Output:
-# upf_packets_total{direction="uplink"} 0
-# upf_packets_total{direction="downlink"} 0
-# upf_bytes_total{direction="uplink"} 0
-# upf_bytes_total{direction="downlink"} 0
-# upf_packet_drops_total{reason="KERNEL_DROP"} 0
-```
-
-#### 4.3 Start API Server
-
-```bash
-# Open another terminal
 cd ~/5G-DPOP
-
-# Start API Server
 ./bin/api-server
 
 # Expected output:
@@ -322,181 +150,147 @@ cd ~/5G-DPOP
 # [INFO] Starting API server on :8080
 ```
 
-#### 4.4 Verify API Server
-
+**Terminal 3 - Web Frontend**
 ```bash
-# Check health endpoint
-curl http://localhost:8080/api/v1/health
-# Output: {"status":"ok","timestamp":"2025-11-29T10:00:00Z","version":"1.0.0"}
-
-# Get traffic statistics
-curl http://localhost:8080/api/v1/metrics/traffic
-# Output: {"uplink":{"packets":0,"bytes":0},"downlink":{"packets":0,"bytes":0}}
-```
-
-#### 4.5 Start Web Frontend
-
-```bash
-# Open another terminal
 cd ~/5G-DPOP/web
-
-# Start development server
 npm run dev
 
 # Expected output:
 #   VITE v5.4.x  ready in xxx ms
 #   ➨  Local:   http://localhost:3000/
-#   ➨  Network: use --host to expose
 ```
 
-#### 4.6 Open Browser
+### Step 5: Start free5GC
 
-Open http://localhost:3000 in your browser to see the 5G-DPOP monitoring dashboard.
-
-> **Note**: The Vite development server is configured in `web/vite.config.ts`, with default port 3000.
-
----
-
-### Step 5: Generate Test Traffic
-
-#### 5.1 Verify free5GC is Running
+After confirming all 5G-DPOP services are running, start free5GC:
 
 ```bash
-# Check free5GC processes
-ps aux | grep -E "(amf|smf|upf|nrf)" | grep -v grep
+cd ~/free5gc-compose
 
-# Check if UPF is working
-curl http://localhost:8000  # NRF API
+# Standard version
+docker compose -f docker-compose.yaml up -d
+
+# Or ULCL version (dual UPF)
+docker compose -f docker-compose-ulcl.yaml up -d
+
+# Verify gNB connection
+docker logs ueransim 2>&1 | tail -5
+# Expected: [ngap] [info] NG Setup procedure is successful
 ```
 
-#### 5.2 Generate Traffic with UERANSIM
-
-On VM2 (UERANSIM), execute:
+### Step 6: Start UE and Generate Traffic
 
 ```bash
-# Start gNB
-cd ~/UERANSIM
-./build/nr-gnb -c config/free5gc-gnb.yaml &
-
 # Start UE
-./build/nr-ue -c config/free5gc-ue.yaml &
+docker exec -d ueransim ./nr-ue -c ./config/uecfg.yaml
 
-# Wait for PDU Session establishment
-sleep 5
+# Wait for UE registration
+sleep 15
 
-# Send ping using UE's tunnel interface
-ping -I uesimtun0 8.8.8.8
+# Check UE status
+docker exec ueransim ./nr-cli -d
+# Expected output:
+# UERANSIM-gnb-208-93-1
+# imsi-208930000000001
 
-# Or generate larger traffic
-iperf3 -c 8.8.8.8 -B 10.60.0.1 -t 60
+# Verify UE is registered
+docker exec ueransim ./nr-cli imsi-208930000000001 -e "status"
+# Expected: cm-state: CM-CONNECTED, rm-state: RM-REGISTERED
+
+# Generate test traffic
+docker exec ueransim ping -I uesimtun0 8.8.8.8 -c 5
+# Expected: 5 packets transmitted, 5 received, 0% packet loss
 ```
 
-#### 5.3 Observe Monitoring Data
+### Step 7: View Monitoring Dashboard
 
-Return to Web Frontend (http://localhost:3000), you should see:
+Open browser and visit: **http://localhost:3000**
 
-- **Traffic Chart**: Uplink/Downlink traffic charts showing data
-- **Stats Cards**: Packet count and bytes continuously increasing
-- **Session Table**: Established PDU Sessions displayed
+You should see:
+- Traffic Chart: Uplink/Downlink traffic charts
+- Stats Cards: Packet count and bytes continuously increasing
+- Session Table: Established PDU Sessions
+- Network Topology: UE → gNB → UPF → DN topology diagram
 
----
-
-### Step 6: Fault Injection Testing (Optional)
-
-#### 6.1 Trigger Fault Injection via API
+## Verify Service Status
 
 ```bash
-# Send fault injection request
-curl -X POST http://localhost:8080/api/v1/fault/inject \
-    -H "Content-Type: application/json" \
-    -d '{"type":"invalid_teid","target":"upf","count":10}'
+# Check Agent
+curl http://localhost:9100/health
+# Expected output: OK
+
+# Check API Server
+curl http://localhost:8080/api/v1/health
+# Expected output: {"status":"ok","timestamp":"...","version":"1.0.0"}
+
+# Check Sessions
+curl http://localhost:8080/api/v1/sessions
+# Expected: PDU Session information displayed
+
+# Check Topology
+curl http://localhost:8080/api/v1/topology
+# Expected: nodes (UE, gNB, UPF, DN) and links displayed
+
+# Check Prometheus metrics
+curl http://localhost:9100/metrics | grep upf_
+# Expected output:
+# upf_packets_total{direction="uplink"} ...
+# upf_packets_total{direction="downlink"} ...
+# upf_bytes_total{direction="uplink"} ...
+# upf_bytes_total{direction="downlink"} ...
 ```
 
-#### 6.2 Observe Drop Alerts
+## API Endpoints
 
-Return to Web Frontend, you should see new drop events in the **Drop Alert Panel**.
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/v1/health` | Health check |
+| `GET /api/v1/sessions` | Get all PDU Sessions |
+| `GET /api/v1/topology` | Get network topology |
+| `GET /api/v1/metrics/traffic` | Get traffic statistics |
 
----
-
-### Common Commands
+## Common Commands
 
 ```bash
-# One-click start all services (recommended to run in separate terminals)
-# Terminal 1: Start Docker Stack
-make compose-up
-
-# Terminal 2: Start Agent (requires root)
-sudo ./bin/agent
-# For free5gc-compose, specify the name of the Docker bridge network.
-# sudo ./bin/agent -pfcp-iface br-free5gc
-
-# Terminal 3: Start API Server
-./bin/api-server
-
-# Terminal 4: Start Web Frontend
-cd web && npm run dev
-
-# Stop all services
-pkill -f agent
-pkill -f api-server
-make compose-down
-
-# View Agent real-time logs
-sudo ./bin/agent 2>&1 | tee agent.log
-
-# Clean and rebuild
-make clean
+# One-click build
 make all
 
-# -------------------------------------------------------
-# UERANSIM Commands
-# Start gNB
-./nr-gnb -c ../config/free5gc-gnb.yaml
+# Start Observability Stack
+make compose-up
 
-# Start multiple UEs (e.g., 5 UEs)
-sudo ./nr-ue -c ../config/free5gc-ue.yaml -n 5
+# Stop Observability Stack
+make compose-down
 
-# Ping from specific UE tunnel
-ping -I uesimtun{X} 8.8.8.8
+# Clean build artifacts
+make clean
 
-# Ping from all UE tunnels
-for i in {0..4}; do ping -I uesimtun$i 8.8.8.8 -c 100 & done
-# -------------------------------------------------------
-
-
-# drop test
-# reference:./scripts/drop_tests/README.md
-cd ~/drop_tests
-sudo bash run_tests.sh
+# Stop all 5G-DPOP services
+pkill -f agent
+pkill -f api-server
 ```
 
----
+## Troubleshooting
 
-## Conclusion
+### Session information is empty
+- Confirm 5G-DPOP was started before free5GC
+- Re-register UE to trigger new PFCP Session:
+  ```bash
+  docker exec ueransim ./nr-cli imsi-208930000000001 -e "deregister normal"
+  sleep 3
+  docker exec -d ueransim ./nr-ue -c ./config/uecfg.yaml
+  ```
 
-5G-DPOP provides a complete 5G UPF data plane observability solution. Its core value lies in:
+### Agent fails to start
+- Confirm running with `sudo`
+- Confirm `gtp5g` module is loaded: `lsmod | grep gtp5g`
+- Confirm BTF support: `ls -la /sys/kernel/btf/vmlinux`
+- Confirm hookable symbols exist: `sudo cat /proc/kallsyms | grep gtp5g_encap_recv`
 
-### Technical Innovation
+### Topology only shows DN node
+- Generate some traffic to update topology
+- Wait a few seconds and refresh the page
+- Confirm Session is established: `curl http://localhost:8080/api/v1/sessions`
 
-1. **Non-intrusive Monitoring**: Leveraging Linux eBPF kprobe technology to directly hook key functions in the `gtp5g` kernel module, without modifying any free5GC or gtp5g source code, achieving truly zero-intrusion monitoring.
-
-2. **High Performance, Low Overhead**: Using Per-CPU eBPF Maps to avoid lock contention, and Ring Buffer for asynchronous event delivery, minimizing the performance impact on UPF.
-
-3. **Control/Data Plane Correlation**: Through PFCP Sniffer listening on the N4 interface between SMF and UPF, establishing mappings between SEID (Session Endpoint Identifier) and TEID (Tunnel Endpoint Identifier), enabling packet-level monitoring data to be correlated with specific PDU Sessions and UEs.
-
-### Practical Value
-
-1. **Real-time Visualization**: Custom-built React frontend dashboard providing real-time traffic monitoring, drop alerts, session status, and other critical information visualization, without relying on external tools like Grafana.
-
-2. **Rapid Problem Identification**: When packet drops occur, you can immediately see the drop reason (NO_PDR_MATCH, INVALID_TEID, QOS_DROP, etc.), significantly reducing troubleshooting time.
-
-3. **Validation and Testing**: Built-in fault injection functionality can actively trigger various abnormal scenarios to validate the monitoring platform's effectiveness, and can be used for Chaos Engineering testing.
-
-### Future Roadmap
-
-- Support more eBPF hook points (e.g., QoS processing, PDR/FAR matching)
-- Integrate Distributed Tracing (Jaeger/Tempo)
-- Support Kubernetes deployment mode
-- Add AI/ML anomaly detection capabilities
-
-This project demonstrates the powerful potential of eBPF technology in 5G core network observability, providing new approaches for telecom network monitoring and operations.
+### Cannot find traffic when using free5gc-compose
+- Agent automatically detects `br-free5gc` network interface
+- If issues persist, manually specify: `sudo ./bin/agent -pfcp-iface br-free5gc`

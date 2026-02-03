@@ -12,6 +12,15 @@ import (
 	"github.com/cilium/ebpf"
 )
 
+type upfMonitorPendingPdrQuery struct {
+	Timestamp uint64
+	Teid      uint32
+	UeIp      uint32
+	Direction uint8
+	Pad       [3]uint8
+	_         [4]byte
+}
+
 type upfMonitorPendingPktInfo struct {
 	Teid      uint32
 	SrcIp     uint32
@@ -78,6 +87,11 @@ type upfMonitorSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type upfMonitorProgramSpecs struct {
+	FentryPdrFindByGtp1u    *ebpf.ProgramSpec `ebpf:"fentry_pdr_find_by_gtp1u"`
+	FentryPdrFindByIpv4     *ebpf.ProgramSpec `ebpf:"fentry_pdr_find_by_ipv4"`
+	FentryPolicePacket      *ebpf.ProgramSpec `ebpf:"fentry_policePacket"`
+	FexitPdrFindByGtp1u     *ebpf.ProgramSpec `ebpf:"fexit_pdr_find_by_gtp1u"`
+	FexitPdrFindByIpv4      *ebpf.ProgramSpec `ebpf:"fexit_pdr_find_by_ipv4"`
 	KprobeGtp5gDevXmit      *ebpf.ProgramSpec `ebpf:"kprobe_gtp5g_dev_xmit"`
 	KprobeGtp5gEncapRecv    *ebpf.ProgramSpec `ebpf:"kprobe_gtp5g_encap_recv"`
 	KprobeGtp5gHandleSkb    *ebpf.ProgramSpec `ebpf:"kprobe_gtp5g_handle_skb"`
@@ -94,14 +108,16 @@ type upfMonitorProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type upfMonitorMapSpecs struct {
-	AgentConfig    *ebpf.MapSpec `ebpf:"agent_config"`
-	DropEvents     *ebpf.MapSpec `ebpf:"drop_events"`
-	PacketEvents   *ebpf.MapSpec `ebpf:"packet_events"`
-	PendingPkts    *ebpf.MapSpec `ebpf:"pending_pkts"`
-	TeidSessionMap *ebpf.MapSpec `ebpf:"teid_session_map"`
-	TeidStats      *ebpf.MapSpec `ebpf:"teid_stats"`
-	TrafficStats   *ebpf.MapSpec `ebpf:"traffic_stats"`
-	UeIpStats      *ebpf.MapSpec `ebpf:"ue_ip_stats"`
+	AgentConfig       *ebpf.MapSpec `ebpf:"agent_config"`
+	DropEvents        *ebpf.MapSpec `ebpf:"drop_events"`
+	PacketEvents      *ebpf.MapSpec `ebpf:"packet_events"`
+	PdrEvents         *ebpf.MapSpec `ebpf:"pdr_events"`
+	PendingPdrQueries *ebpf.MapSpec `ebpf:"pending_pdr_queries"`
+	PendingPkts       *ebpf.MapSpec `ebpf:"pending_pkts"`
+	TeidSessionMap    *ebpf.MapSpec `ebpf:"teid_session_map"`
+	TeidStats         *ebpf.MapSpec `ebpf:"teid_stats"`
+	TrafficStats      *ebpf.MapSpec `ebpf:"traffic_stats"`
+	UeIpStats         *ebpf.MapSpec `ebpf:"ue_ip_stats"`
 }
 
 // upfMonitorObjects contains all objects after they have been loaded into the kernel.
@@ -123,14 +139,16 @@ func (o *upfMonitorObjects) Close() error {
 //
 // It can be passed to loadUpfMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type upfMonitorMaps struct {
-	AgentConfig    *ebpf.Map `ebpf:"agent_config"`
-	DropEvents     *ebpf.Map `ebpf:"drop_events"`
-	PacketEvents   *ebpf.Map `ebpf:"packet_events"`
-	PendingPkts    *ebpf.Map `ebpf:"pending_pkts"`
-	TeidSessionMap *ebpf.Map `ebpf:"teid_session_map"`
-	TeidStats      *ebpf.Map `ebpf:"teid_stats"`
-	TrafficStats   *ebpf.Map `ebpf:"traffic_stats"`
-	UeIpStats      *ebpf.Map `ebpf:"ue_ip_stats"`
+	AgentConfig       *ebpf.Map `ebpf:"agent_config"`
+	DropEvents        *ebpf.Map `ebpf:"drop_events"`
+	PacketEvents      *ebpf.Map `ebpf:"packet_events"`
+	PdrEvents         *ebpf.Map `ebpf:"pdr_events"`
+	PendingPdrQueries *ebpf.Map `ebpf:"pending_pdr_queries"`
+	PendingPkts       *ebpf.Map `ebpf:"pending_pkts"`
+	TeidSessionMap    *ebpf.Map `ebpf:"teid_session_map"`
+	TeidStats         *ebpf.Map `ebpf:"teid_stats"`
+	TrafficStats      *ebpf.Map `ebpf:"traffic_stats"`
+	UeIpStats         *ebpf.Map `ebpf:"ue_ip_stats"`
 }
 
 func (m *upfMonitorMaps) Close() error {
@@ -138,6 +156,8 @@ func (m *upfMonitorMaps) Close() error {
 		m.AgentConfig,
 		m.DropEvents,
 		m.PacketEvents,
+		m.PdrEvents,
+		m.PendingPdrQueries,
 		m.PendingPkts,
 		m.TeidSessionMap,
 		m.TeidStats,
@@ -150,6 +170,11 @@ func (m *upfMonitorMaps) Close() error {
 //
 // It can be passed to loadUpfMonitorObjects or ebpf.CollectionSpec.LoadAndAssign.
 type upfMonitorPrograms struct {
+	FentryPdrFindByGtp1u    *ebpf.Program `ebpf:"fentry_pdr_find_by_gtp1u"`
+	FentryPdrFindByIpv4     *ebpf.Program `ebpf:"fentry_pdr_find_by_ipv4"`
+	FentryPolicePacket      *ebpf.Program `ebpf:"fentry_policePacket"`
+	FexitPdrFindByGtp1u     *ebpf.Program `ebpf:"fexit_pdr_find_by_gtp1u"`
+	FexitPdrFindByIpv4      *ebpf.Program `ebpf:"fexit_pdr_find_by_ipv4"`
 	KprobeGtp5gDevXmit      *ebpf.Program `ebpf:"kprobe_gtp5g_dev_xmit"`
 	KprobeGtp5gEncapRecv    *ebpf.Program `ebpf:"kprobe_gtp5g_encap_recv"`
 	KprobeGtp5gHandleSkb    *ebpf.Program `ebpf:"kprobe_gtp5g_handle_skb"`
@@ -164,6 +189,11 @@ type upfMonitorPrograms struct {
 
 func (p *upfMonitorPrograms) Close() error {
 	return _UpfMonitorClose(
+		p.FentryPdrFindByGtp1u,
+		p.FentryPdrFindByIpv4,
+		p.FentryPolicePacket,
+		p.FexitPdrFindByGtp1u,
+		p.FexitPdrFindByIpv4,
 		p.KprobeGtp5gDevXmit,
 		p.KprobeGtp5gEncapRecv,
 		p.KprobeGtp5gHandleSkb,

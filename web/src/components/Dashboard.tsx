@@ -37,12 +37,10 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
     const uplinkTp = formatThroughput(metrics.uplink.throughput_mbps)
     const downlinkTp = formatThroughput(metrics.downlink.throughput_mbps)
 
-    // Calculate totals
     const totalPackets = metrics.uplink.packets + metrics.downlink.packets
     const totalBytes = metrics.uplink.bytes + metrics.downlink.bytes
     const totalTEIDs = sessions.reduce((acc, s) => acc + s.teids.length, 0)
 
-    // Theme-based classes
     const cardBg = theme === 'dark' ? 'bg-slate-800/50' : 'bg-white'
     const cardBorder = theme === 'dark' ? 'border-slate-700' : 'border-gray-200'
     const textPrimary = theme === 'dark' ? 'text-white' : 'text-gray-900'
@@ -53,9 +51,7 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
 
     return (
         <div className="space-y-6 pb-16">
-            {/* Stats Cards - Enhanced */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                {/* Uplink Card */}
                 <div className={`${cardBg} rounded-xl p-5 border ${cardBorder} hover:border-green-500/50 transition-colors`}>
                     <div className="flex items-center justify-between mb-3">
                         <span className={`${textSecondary} text-sm`}>Uplink Traffic</span>
@@ -75,7 +71,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                             <div className={`${textValue} font-mono`}>{formatBytes(metrics.uplink.bytes)}</div>
                         </div>
                     </div>
-                    {/* Progress bar showing UL/DL ratio */}
                     <div className="mt-3">
                         <div className={`h-1.5 ${progressBg} rounded-full overflow-hidden`}>
                             <div
@@ -89,7 +84,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                     </div>
                 </div>
 
-                {/* Downlink Card */}
                 <div className={`${cardBg} rounded-xl p-5 border ${cardBorder} hover:border-blue-500/50 transition-colors`}>
                     <div className="flex items-center justify-between mb-3">
                         <span className={`${textSecondary} text-sm`}>Downlink Traffic</span>
@@ -109,7 +103,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                             <div className={`${textValue} font-mono`}>{formatBytes(metrics.downlink.bytes)}</div>
                         </div>
                     </div>
-                    {/* Progress bar showing DL/UL ratio */}
                     <div className="mt-3">
                         <div className={`h-1.5 ${progressBg} rounded-full overflow-hidden`}>
                             <div
@@ -123,7 +116,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                     </div>
                 </div>
 
-                {/* Drop Rate Card */}
                 <div className={`${cardBg} rounded-xl p-5 border transition-colors ${drops.rate_percent > 1
                     ? 'border-red-500 pulse-alert'
                     : drops.rate_percent > 0
@@ -158,7 +150,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                             <div className={`${textValue} font-mono`}>{Object.keys(drops.by_reason || {}).length}</div>
                         </div>
                     </div>
-                    {/* Drop reasons mini chart */}
                     {Object.keys(drops.by_reason || {}).length > 0 && (
                         <div className="mt-3 flex gap-1">
                             {Object.entries(drops.by_reason).slice(0, 3).map(([reason, count], idx) => (
@@ -176,7 +167,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                     )}
                 </div>
 
-                {/* Sessions Card */}
                 <div className={`${cardBg} rounded-xl p-5 border ${cardBorder} hover:border-cyan-500/50 transition-colors`}>
                     <div className="flex items-center justify-between mb-3">
                         <span className={`${textSecondary} text-sm`}>Active Sessions</span>
@@ -196,7 +186,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                             <div className={`${textValue} font-mono`}>{new Set(sessions.map(s => s.ue_ip)).size}</div>
                         </div>
                     </div>
-                    {/* Session indicators */}
                     <div className="mt-3 flex gap-1">
                         {sessions.slice(0, 8).map((s, idx) => (
                             <div
@@ -212,7 +201,6 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                 </div>
             </div>
 
-            {/* Summary Stats Bar */}
             <div className={`${cardBg} rounded-xl p-4 border ${cardBorder} flex flex-wrap justify-center gap-8`}>
                 <div className="text-center">
                     <div className={`text-sm ${textMuted}`}>Total Packets</div>
@@ -236,13 +224,11 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                 </div>
             </div>
 
-            {/* Traffic Chart */}
             <div className={`${cardBg} rounded-xl p-5 border ${cardBorder}`}>
                 <h2 className={`text-lg font-semibold ${textPrimary} mb-4`}>Live Traffic (Last 60s)</h2>
                 <TrafficChart metrics={metrics} theme={theme} />
             </div>
 
-            {/* Session Traffic Analysis - NEW */}
             <div className={`${cardBg} rounded-xl p-5 border ${cardBorder}`}>
                 <div className="flex items-center justify-between mb-4">
                     <h2 className={`text-lg font-semibold ${textPrimary}`}>Per-Session Traffic Analysis</h2>
@@ -253,22 +239,18 @@ export default function Dashboard({ metrics, drops, sessions, theme }: Dashboard
                 <SessionTrafficChart sessions={sessions} theme={theme} />
             </div>
 
-            {/* Two Column Layout */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                {/* Drop Alert Panel */}
                 <div className={`${cardBg} rounded-xl p-5 border ${cardBorder}`}>
                     <h2 className={`text-lg font-semibold ${textPrimary} mb-4`}>Drop Events</h2>
                     <DropAlertPanel drops={drops} sessions={sessions} theme={theme} />
                 </div>
 
-                {/* Session Table */}
                 <div className={`${cardBg} rounded-xl p-5 border ${cardBorder}`}>
                     <h2 className={`text-lg font-semibold ${textPrimary} mb-4`}>PDU Sessions (SEID ↔ TEID)</h2>
                     <SessionTable theme={theme} />
                 </div>
             </div>
 
-            {/* Network Topology */}
             <div className={`${cardBg} rounded-xl p-5 border ${cardBorder}`}>
                 <h2 className={`text-lg font-semibold ${textPrimary} mb-4`}>Network Topology</h2>
                 <Topology sessions={sessions} drops={drops} theme={theme} />

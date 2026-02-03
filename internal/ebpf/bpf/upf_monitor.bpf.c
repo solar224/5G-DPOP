@@ -178,6 +178,46 @@ struct
 } pending_pkts SEC(".maps");
 
 // ============================================================================
+// PDR Lookup Event - for session validation via fentry/fexit
+// ============================================================================
+
+// PDR lookup event structure (sent to userspace for session validation)
+struct pdr_lookup_event
+{
+    __u64 timestamp;
+    __u32 teid;            // TEID being looked up (if available)
+    __u8 pdr_found;        // 1 = found, 0 = not found
+    __u8 direction;        // 0 = uplink (by TEID), 1 = downlink (by IP)
+    __u8 pad[2];
+    __u64 lookup_latency_ns;
+};
+
+// Ring buffer for PDR lookup events
+struct
+{
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 64 * 1024); // 64KB
+} pdr_events SEC(".maps");
+
+// Pending PDR query info - for passing data from fentry to fexit
+struct pending_pdr_query
+{
+    __u64 timestamp;
+    __u32 teid;
+    __u32 ue_ip;
+    __u8 direction;
+    __u8 pad[3];
+};
+
+struct
+{
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, __u32); // PID/TID
+    __type(value, struct pending_pdr_query);
+} pending_pdr_queries SEC(".maps");
+
+// ============================================================================
 // Helper Functions
 // ============================================================================
 
@@ -651,6 +691,119 @@ int BPF_KRETPROBE(kretprobe_ip_forward, int ret)
     {
         emit_drop_event(0, 0, 0, 0, 0, 0, DROP_REASON_NO_ROUTE, 0); // Code 3: No route
     }
+    return 0;
+}
+
+// ============================================================================
+// fentry/fexit hooks - Higher efficiency PDR lookup tracking
+// Reference: gtp5g-tracer project
+// ============================================================================
+
+// Helper: emit PDR lookup event to userspace
+static __always_inline void emit_pdr_lookup_event(__u32 teid, __u8 pdr_found,
+                                                   __u8 direction, __u64 latency_ns)
+{
+    struct pdr_lookup_event *event;
+
+    event = bpf_ringbuf_reserve(&pdr_events, sizeof(*event), 0);
+    if (!event)
+    {
+        return;
+    }
+
+    event->timestamp = bpf_ktime_get_ns();
+    event->teid = teid;
+    event->pdr_found = pdr_found;
+    event->direction = direction;
+    event->lookup_latency_ns = latency_ns;
+
+    bpf_ringbuf_submit(event, 0);
+}
+
+// fentry hook for pdr_find_by_gtp1u - Entry point for uplink PDR lookup
+// This provides more efficient tracking than kretprobe
+SEC("fentry/pdr_find_by_gtp1u")
+int BPF_PROG(fentry_pdr_find_by_gtp1u)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pending_pdr_query query = {0};
+
+    query.timestamp = bpf_ktime_get_ns();
+    query.direction = DIRECTION_UPLINK;
+    // TEID extraction would require access to function args
+    // For now, we track timing and result
+
+    bpf_map_update_elem(&pending_pdr_queries, &pid, &query, BPF_ANY);
+    return 0;
+}
+
+// fexit hook for pdr_find_by_gtp1u - Capture PDR lookup result
+SEC("fexit/pdr_find_by_gtp1u")
+int BPF_PROG(fexit_pdr_find_by_gtp1u, void *ret)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pending_pdr_query *query;
+
+    query = bpf_map_lookup_elem(&pending_pdr_queries, &pid);
+    if (!query)
+    {
+        return 0;
+    }
+
+    __u64 latency = bpf_ktime_get_ns() - query->timestamp;
+    __u8 pdr_found = (ret != NULL) ? 1 : 0;
+
+    // Emit event for userspace processing
+    emit_pdr_lookup_event(query->teid, pdr_found, query->direction, latency);
+
+    // Cleanup
+    bpf_map_delete_elem(&pending_pdr_queries, &pid);
+    return 0;
+}
+
+// fentry hook for pdr_find_by_ipv4 - Entry point for downlink PDR lookup
+SEC("fentry/pdr_find_by_ipv4")
+int BPF_PROG(fentry_pdr_find_by_ipv4)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pending_pdr_query query = {0};
+
+    query.timestamp = bpf_ktime_get_ns();
+    query.direction = DIRECTION_DOWNLINK;
+
+    bpf_map_update_elem(&pending_pdr_queries, &pid, &query, BPF_ANY);
+    return 0;
+}
+
+// fexit hook for pdr_find_by_ipv4 - Capture downlink PDR lookup result
+SEC("fexit/pdr_find_by_ipv4")
+int BPF_PROG(fexit_pdr_find_by_ipv4, void *ret)
+{
+    __u32 pid = bpf_get_current_pid_tgid() >> 32;
+    struct pending_pdr_query *query;
+
+    query = bpf_map_lookup_elem(&pending_pdr_queries, &pid);
+    if (!query)
+    {
+        return 0;
+    }
+
+    __u64 latency = bpf_ktime_get_ns() - query->timestamp;
+    __u8 pdr_found = (ret != NULL) ? 1 : 0;
+
+    emit_pdr_lookup_event(0, pdr_found, query->direction, latency);
+
+    bpf_map_delete_elem(&pending_pdr_queries, &pid);
+    return 0;
+}
+
+// fentry hook for policePacket - QoS enforcement entry
+// From gtp5g-tracer: tracks when QoS policing is applied
+SEC("fentry/policePacket")
+int BPF_PROG(fentry_policePacket)
+{
+    // QoS policing is being applied
+    // This can be extended to emit QoS events in the future
     return 0;
 }
 

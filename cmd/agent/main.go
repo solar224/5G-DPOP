@@ -22,7 +22,12 @@ import (
 
 var (
 	// Command line flags
-	pfcpIface = flag.String("pfcp-iface", "lo", "Interface to capture PFCP packets")
+	// Default to "auto" for automatic interface detection
+	// The auto-detection will find the best interface for PFCP capture:
+	// - Looks for br-free5gc, Docker bridges, interfaces with 5G network IPs
+	// - Falls back to "any" (all interfaces) if no specific match
+	// Use -pfcp-iface to override (e.g., "lo" for local testing, "br-free5gc" for specific bridge)
+	pfcpIface = flag.String("pfcp-iface", "auto", "Interface to capture PFCP packets (use 'auto' for automatic detection)")
 
 	// Prometheus metrics
 	packetsTotal = prometheus.NewCounterVec(
@@ -124,9 +129,14 @@ type SessionJSON struct {
 	MBRDownlink uint64 `json:"mbr_dl_kbps,omitempty"`
 
 	// Status
-	Status     string `json:"status"`
-	Duration   string `json:"duration"`
-	LastActive string `json:"last_active,omitempty"`
+	Status              string `json:"status"`
+	Duration            string `json:"duration"`
+	LastActive          string `json:"last_active,omitempty"`
+	EstablishmentStatus string `json:"establishment_status,omitempty"` // Pending, Established, Failed
+
+	// Data Plane status (based on actual packet activity)
+	DataPlaneStatus string `json:"data_plane_status,omitempty"` // Active, Stale, Inactive
+	LastPacketTime  string `json:"last_packet_time,omitempty"`  // Last packet activity timestamp
 }
 
 func init() {
@@ -293,6 +303,9 @@ func startHTTPServer() {
 	// Drop tracing control API
 	http.HandleFunc("/api/config/drop-tracing", handleDropTracingConfig)
 
+	// Interface detection API - for debugging and configuration
+	http.HandleFunc("/api/interfaces", handleInterfacesAPI)
+
 	log.Println("[INFO] HTTP server listening on :9100")
 	if err := http.ListenAndServe(":9100", nil); err != nil {
 		log.Printf("HTTP server error: %v", err)
@@ -323,113 +336,178 @@ func handleDropsAPI(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// convertSessionToJSON converts a pfcp.Session to SessionJSON
+func convertSessionToJSON(s *pfcp.Session) SessionJSON {
+	teids := make([]string, 0, len(s.TEIDs))
+	for _, teid := range s.TEIDs {
+		teids = append(teids, fmt.Sprintf("0x%x", teid))
+	}
+
+	// Extract UL/DL TEIDs (convention: first is UL, second is DL)
+	teidUL := ""
+	teidDL := ""
+	if len(s.TEIDs) >= 1 {
+		teidUL = fmt.Sprintf("0x%x", s.TEIDs[0])
+	}
+	if len(s.TEIDs) >= 2 {
+		teidDL = fmt.Sprintf("0x%x", s.TEIDs[1])
+	}
+
+	ueIP := "N/A"
+	if s.UEIP != nil {
+		ueIP = s.UEIP.String()
+	}
+
+	upfIP := ""
+	if s.UPFIP != nil {
+		upfIP = s.UPFIP.String()
+	}
+
+	gnbIP := ""
+	if s.GNBIP != nil {
+		gnbIP = s.GNBIP.String()
+	}
+
+	uplinkPeerIP := ""
+	if s.UplinkPeerIP != nil {
+		uplinkPeerIP = s.UplinkPeerIP.String()
+	}
+
+	n9PeerIP := ""
+	if s.N9PeerIP != nil {
+		n9PeerIP = s.N9PeerIP.String()
+	}
+
+	// Calculate duration
+	duration := time.Since(s.CreatedAt)
+	durationStr := formatDuration(duration)
+
+	// Determine status
+	status := "Active"
+	if s.Status != "" {
+		status = s.Status
+	}
+
+	lastActive := ""
+	if !s.LastActive.IsZero() {
+		lastActive = s.LastActive.Format(time.RFC3339)
+	}
+
+	// Get establishment status
+	establishmentStatus := s.EstablishmentStatus
+	if establishmentStatus == "" {
+		establishmentStatus = pfcp.EstablishmentEstablished // Default for legacy sessions
+	}
+
+	// Get data plane status
+	dataPlaneStatus := s.DataPlaneStatus
+	if dataPlaneStatus == "" {
+		dataPlaneStatus = pfcp.DataPlaneInactive // Default if not set
+	}
+
+	// Format last packet time
+	lastPacketTime := ""
+	if !s.LastPacketTime.IsZero() {
+		lastPacketTime = s.LastPacketTime.Format(time.RFC3339)
+	}
+
+	return SessionJSON{
+		SEID:      fmt.Sprintf("0x%x", s.SEID),
+		UEIP:      ueIP,
+		TEIDs:     teids,
+		TEIDUL:    teidUL,
+		TEIDDL:    teidDL,
+		CreatedAt: s.CreatedAt.Format(time.RFC3339),
+		PacketsUL: s.PacketsUL,
+		PacketsDL: s.PacketsDL,
+
+		// Extended fields
+		UPFIP:        upfIP,
+		GNBIP:        gnbIP,
+		UplinkPeerIP: uplinkPeerIP,
+		N9PeerIP:     n9PeerIP,
+		SUPI:         s.SUPI,
+		DNN:          s.DNN,
+		SNssai:       s.SNssai,
+		QFI:          s.QFI,
+		SessionType:  s.SessionType,
+		SessionID:    s.SessionID,
+
+		// Traffic
+		BytesUL: s.BytesUL,
+		BytesDL: s.BytesDL,
+
+		// QoS
+		QoS5QI:      s.QoS5QI,
+		ARPPL:       s.ARPPL,
+		GBRUplink:   s.GBRUplink,
+		GBRDownlink: s.GBRDownlink,
+		MBRUplink:   s.MBRUplink,
+		MBRDownlink: s.MBRDownlink,
+
+		// Status
+		Status:              status,
+		Duration:            durationStr,
+		LastActive:          lastActive,
+		EstablishmentStatus: establishmentStatus,
+
+		// Data Plane status
+		DataPlaneStatus: dataPlaneStatus,
+		LastPacketTime:  lastPacketTime,
+	}
+}
+
 func handleSessionsAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	sessions := pfcpCorrelation.GetAllSessions()
+	allSessions := pfcpCorrelation.GetAllSessions()
 
-	sessionList := make([]SessionJSON, 0, len(sessions))
-	for _, s := range sessions {
-		teids := make([]string, 0, len(s.TEIDs))
-		for _, teid := range s.TEIDs {
-			teids = append(teids, fmt.Sprintf("0x%x", teid))
+	// Separate sessions by establishment status AND data plane status
+	activeSessions := make([]SessionJSON, 0)  // Established + Active data plane
+	staleSessions := make([]SessionJSON, 0)   // Established but no recent traffic
+	failedSessions := make([]SessionJSON, 0)  // Failed establishment
+	pendingSessions := make([]SessionJSON, 0) // Pending establishment
+
+	for _, s := range allSessions {
+		sessionJSON := convertSessionToJSON(s)
+
+		switch s.EstablishmentStatus {
+		case pfcp.EstablishmentFailed:
+			failedSessions = append(failedSessions, sessionJSON)
+		case pfcp.EstablishmentPending:
+			pendingSessions = append(pendingSessions, sessionJSON)
+		default: // Established or empty (legacy)
+			// Further classify by data plane status
+			if s.DataPlaneStatus == pfcp.DataPlaneActive {
+				activeSessions = append(activeSessions, sessionJSON)
+			} else {
+				// Stale or Inactive (no recent traffic)
+				staleSessions = append(staleSessions, sessionJSON)
+			}
 		}
-
-		// Extract UL/DL TEIDs (convention: first is UL, second is DL)
-		teidUL := ""
-		teidDL := ""
-		if len(s.TEIDs) >= 1 {
-			teidUL = fmt.Sprintf("0x%x", s.TEIDs[0])
-		}
-		if len(s.TEIDs) >= 2 {
-			teidDL = fmt.Sprintf("0x%x", s.TEIDs[1])
-		}
-
-		ueIP := "N/A"
-		if s.UEIP != nil {
-			ueIP = s.UEIP.String()
-		}
-
-		upfIP := ""
-		if s.UPFIP != nil {
-			upfIP = s.UPFIP.String()
-		}
-
-		gnbIP := ""
-		if s.GNBIP != nil {
-			gnbIP = s.GNBIP.String()
-		}
-
-		uplinkPeerIP := ""
-		if s.UplinkPeerIP != nil {
-			uplinkPeerIP = s.UplinkPeerIP.String()
-		}
-
-		n9PeerIP := ""
-		if s.N9PeerIP != nil {
-			n9PeerIP = s.N9PeerIP.String()
-		}
-
-		// Calculate duration
-		duration := time.Since(s.CreatedAt)
-		durationStr := formatDuration(duration)
-
-		// Determine status
-		status := "Active"
-		if s.Status != "" {
-			status = s.Status
-		}
-
-		lastActive := ""
-		if !s.LastActive.IsZero() {
-			lastActive = s.LastActive.Format(time.RFC3339)
-		}
-
-		sessionList = append(sessionList, SessionJSON{
-			SEID:      fmt.Sprintf("0x%x", s.SEID),
-			UEIP:      ueIP,
-			TEIDs:     teids,
-			TEIDUL:    teidUL,
-			TEIDDL:    teidDL,
-			CreatedAt: s.CreatedAt.Format(time.RFC3339),
-			PacketsUL: s.PacketsUL,
-			PacketsDL: s.PacketsDL,
-
-			// Extended fields
-			UPFIP:        upfIP,
-			GNBIP:        gnbIP,
-			UplinkPeerIP: uplinkPeerIP,
-			N9PeerIP:     n9PeerIP,
-			SUPI:         s.SUPI,
-			DNN:          s.DNN,
-			SNssai:       s.SNssai,
-			QFI:          s.QFI,
-			SessionType:  s.SessionType,
-			SessionID:    s.SessionID,
-
-			// Traffic
-			BytesUL: s.BytesUL,
-			BytesDL: s.BytesDL,
-
-			// QoS
-			QoS5QI:      s.QoS5QI,
-			ARPPL:       s.ARPPL,
-			GBRUplink:   s.GBRUplink,
-			GBRDownlink: s.GBRDownlink,
-			MBRUplink:   s.MBRUplink,
-			MBRDownlink: s.MBRDownlink,
-
-			// Status
-			Status:     status,
-			Duration:   durationStr,
-			LastActive: lastActive,
-		})
 	}
 
+	// Response structure:
+	// - "total": count of data plane active sessions only
+	// - "sessions": sessions with active data plane (have recent traffic)
+	// - "stale_sessions": established but no recent traffic (possibly disconnected)
+	// - "failed_sessions": failed establishments
+	// - "pending_sessions": waiting for establishment confirmation
+	// - "total_all": total count including all states
 	response := map[string]interface{}{
-		"total":    len(sessionList),
-		"sessions": sessionList,
+		"total":            len(activeSessions), // Only count data plane active for "Active Sessions" metric
+		"sessions":         activeSessions,      // Sessions with active data plane
+		"stale_sessions":   staleSessions,       // Established but no recent traffic
+		"failed_sessions":  failedSessions,      // Failed establishments
+		"pending_sessions": pendingSessions,     // Still waiting for confirmation
+		"total_all":        len(allSessions),    // Total including all states
+		"counts": map[string]int{
+			"active":  len(activeSessions),
+			"stale":   len(staleSessions),
+			"failed":  len(failedSessions),
+			"pending": len(pendingSessions),
+		},
 	}
 
 	json.NewEncoder(w).Encode(response)
@@ -492,6 +570,38 @@ func handleDropTracingConfig(w http.ResponseWriter, r *http.Request) {
 		"message": fmt.Sprintf("Drop tracing %s", state),
 		"enabled": req.Enabled,
 	})
+}
+
+// handleInterfacesAPI returns information about network interfaces
+// Useful for debugging and manual configuration
+func handleInterfacesAPI(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Get the auto-detected interface
+	autoDetected, reason := pfcp.AutoDetectInterface()
+
+	// Get all available interfaces
+	interfaces := pfcp.DetectAndListInterfaces()
+
+	// Get current PFCP interface being used
+	currentIface := *pfcpIface
+
+	response := map[string]interface{}{
+		"current_config":    currentIface,
+		"auto_detected":     autoDetected,
+		"detection_reason":  reason,
+		"available_interfaces": interfaces,
+		"help": map[string]string{
+			"auto":         "Automatically detect the best interface for PFCP capture",
+			"any":          "Capture from all interfaces (may include irrelevant traffic)",
+			"br-free5gc":   "Docker bridge for free5gc-compose (common setup)",
+			"lo":           "Loopback interface (for local testing only)",
+			"<interface>":  "Specify any interface name from the available_interfaces list",
+		},
+	}
+
+	json.NewEncoder(w).Encode(response)
 }
 
 // formatDuration formats a duration into a human-readable string
@@ -566,6 +676,7 @@ func collectStats(loader *ebpf.Loader) {
 }
 
 // updateSessionStatsFromEBPF syncs TEID stats from eBPF to session objects
+// Also updates DataPlaneStatus based on actual traffic activity
 func updateSessionStatsFromEBPF(loader *ebpf.Loader) {
 	// Update uplink stats from TEID counters
 	teidStats, err := loader.GetAllTEIDStats()
@@ -573,9 +684,10 @@ func updateSessionStatsFromEBPF(loader *ebpf.Loader) {
 		for teid, stats := range teidStats {
 			session, found := pfcpCorrelation.GetSessionByTEID(teid)
 			if found && session != nil {
-				// Only update LastActive if traffic increased
+				// Check if traffic increased - this means packets are flowing
 				if stats.Packets > session.PacketsUL || stats.Bytes > session.BytesUL {
-					session.LastActive = time.Now()
+					// Update data plane status via correlation method
+					pfcpCorrelation.UpdatePacketActivity(teid)
 				}
 				// TEID stats are uplink traffic
 				session.PacketsUL = stats.Packets
@@ -592,9 +704,10 @@ func updateSessionStatsFromEBPF(loader *ebpf.Loader) {
 			ueIP := ebpf.FormatIP(ueIPUint32)
 			session, found := pfcpCorrelation.GetSessionByUEIP(ueIP)
 			if found && session != nil {
-				// Only update LastActive if traffic increased
+				// Check if traffic increased - this means packets are flowing
 				if stats.Packets > session.PacketsDL || stats.Bytes > session.BytesDL {
-					session.LastActive = time.Now()
+					// Update data plane status via correlation method
+					pfcpCorrelation.UpdatePacketActivityByUEIP(ueIP)
 				}
 				// UE IP stats are downlink traffic
 				session.PacketsDL = stats.Packets

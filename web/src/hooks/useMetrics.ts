@@ -64,7 +64,6 @@ export function useMetrics(): MetricsState {
                 },
                 () => {
                     setConnected(false)
-                    // Attempt reconnection after 3 seconds
                     reconnectTimeoutRef.current = window.setTimeout(() => {
                         connectWebSocket()
                     }, 3000)
@@ -72,7 +71,6 @@ export function useMetrics(): MetricsState {
             )
         } catch (e) {
             setError('Failed to create WebSocket connection')
-            // Fallback to polling
             pollMetrics()
         }
     }, [])
@@ -85,21 +83,20 @@ export function useMetrics(): MetricsState {
                 fetchSessions(),
             ])
 
-            // Debug log
-            console.log('useMetrics poll:', {
-                uplink_mbps: trafficData.uplink.throughput_mbps,
-                downlink_mbps: trafficData.downlink.throughput_mbps,
-                uplink_pkts: trafficData.uplink.packets,
-            })
-
             setMetrics(trafficData)
-            // Ensure drops has proper defaults for null values
             setDrops({
                 ...dropsData,
                 recent_drops: dropsData.recent_drops || [],
                 by_reason: dropsData.by_reason || {},
             })
-            setSessions(sessionsData.sessions || [])
+            // Combine all session types so they don't disappear when becoming stale
+            const allSessions = [
+                ...(sessionsData.sessions || []),
+                ...(sessionsData.stale_sessions || []),
+                ...(sessionsData.pending_sessions || []),
+                ...(sessionsData.failed_sessions || []),
+            ]
+            setSessions(allSessions)
             setError(null)
         } catch (e) {
             setError('Failed to fetch metrics')
@@ -107,13 +104,9 @@ export function useMetrics(): MetricsState {
     }, [])
 
     useEffect(() => {
-        // Initial data fetch
         pollMetrics()
-
-        // Try WebSocket connection
         connectWebSocket()
 
-        // Fallback polling interval (every 2 seconds)
         const pollInterval = setInterval(pollMetrics, 2000)
 
         return () => {
@@ -130,7 +123,6 @@ export function useMetrics(): MetricsState {
     return { metrics, drops, sessions, connected, error }
 }
 
-// History hook for charts
 export function useMetricsHistory(metrics: TrafficStats, maxPoints = 60) {
     const [history, setHistory] = useState<Array<{
         time: string
@@ -149,7 +141,6 @@ export function useMetricsHistory(metrics: TrafficStats, maxPoints = 60) {
                     downlink: metrics.downlink.throughput_mbps,
                 }
             ]
-            // Keep only last maxPoints entries
             if (newHistory.length > maxPoints) {
                 return newHistory.slice(-maxPoints)
             }

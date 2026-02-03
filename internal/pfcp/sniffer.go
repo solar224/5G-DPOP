@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,6 +24,8 @@ const (
 	MsgTypeSessionModificationResponse  = 53
 	MsgTypeSessionDeletionRequest       = 54
 	MsgTypeSessionDeletionResponse      = 55
+	MsgTypeSessionReportRequest         = 56
+	MsgTypeSessionReportResponse        = 57
 )
 
 // PFCP IE Types (3GPP TS 29.244)
@@ -33,11 +36,14 @@ const (
 	IETypeForwardingParameters = 4   // Forwarding Parameters
 	IETypeCreateURR            = 6   // Create URR
 	IETypeCreateQER            = 7   // Create QER
+	IETypeCause                = 19  // Cause
 	IETypeSourceInterface      = 20  // Source Interface
 	IETypeFTEID                = 21  // F-TEID
 	IETypeNetworkInstance      = 22  // Network Instance (DNN)
 	IETypeSDFFilter            = 23  // SDF Filter
 	IETypeApplicationID        = 24  // Application ID
+	IETypeFSEID                = 57  // F-SEID (Fully Qualified SEID)
+
 	IETypeGateStatus           = 25  // Gate Status
 	IETypeMBR                  = 26  // MBR (Maximum Bit Rate)
 	IETypeGBR                  = 27  // GBR (Guaranteed Bit Rate)
@@ -53,6 +59,23 @@ const (
 	IETypeSNSSAI               = 148 // S-NSSAI (Network Slice Selection Assistance Information)
 	IEType3GPPInterfaceType    = 160 // 3GPP Interface Type
 )
+
+// Establishment status constants
+const (
+	EstablishmentPending     = "Pending"     // Session Establishment Request received, waiting for completion
+	EstablishmentEstablished = "Established" // Session Modification received, session is fully established
+	EstablishmentFailed      = "Failed"      // Session timed out without completion (likely N1N2 failure)
+)
+
+// Data Plane status constants - based on actual traffic activity
+const (
+	DataPlaneActive   = "Active"   // Has recent packet activity
+	DataPlaneStale    = "Stale"    // No packets for longer than StaleTimeout
+	DataPlaneInactive = "Inactive" // No packets seen yet (newly established)
+)
+
+// StaleTimeout defines how long without packets before a session is considered stale
+const StaleTimeout = 60 * time.Second
 
 // Session represents a PFCP session with its associated TEIDs
 type Session struct {
@@ -95,28 +118,321 @@ type Session struct {
 	// Status
 	Status     string // Active, Idle, Releasing
 	LastActive time.Time
+
+	// Establishment tracking - distinguishes successful vs failed session establishments
+	EstablishmentStatus string    // Pending, Established, Failed
+	EstablishmentTime   time.Time // When establishment was first attempted
+
+	// Data Plane status tracking - based on actual packet activity
+	DataPlaneStatus string    // Active, Stale, Inactive
+	LastPacketTime  time.Time // Last time a packet was seen (UL or DL)
+}
+
+// IsDataPlaneActive returns true if the session has an active data plane
+// This method provides a comprehensive check combining multiple conditions:
+// 1. Session must be in Established state
+// 2. Must have recent packet activity (within StaleTimeout)
+// 3. Must have at least one valid TEID (indicating GTP tunnel exists)
+func (s *Session) IsDataPlaneActive() bool {
+	// Condition 1: EstablishmentStatus must be Established
+	if s.EstablishmentStatus != EstablishmentEstablished {
+		return false
+	}
+
+	// Condition 2: Must have recent packet activity (within StaleTimeout)
+	if s.LastPacketTime.IsZero() || time.Since(s.LastPacketTime) > StaleTimeout {
+		return false
+	}
+
+	// Condition 3: Must have at least one valid TEID (GTP tunnel exists)
+	hasValidTEID := false
+	for _, teid := range s.TEIDs {
+		if teid > 0 {
+			hasValidTEID = true
+			break
+		}
+	}
+
+	return hasValidTEID
+}
+
+// HasValidGTPTunnel returns true if the session has at least one valid TEID
+func (s *Session) HasValidGTPTunnel() bool {
+	for _, teid := range s.TEIDs {
+		if teid > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // Correlation manages the mapping between sessions and TEIDs
 type Correlation struct {
-	mu          sync.RWMutex
-	sessions    map[uint64]*Session // SEID -> Session
-	teidMap     map[uint32]uint64   // TEID -> SEID
-	ueIPMap     map[string]uint64   // UE IP string -> primary SEID (for deduplication)
-	seidCounter uint64              // Counter for generating unique SEIDs
+	mu           sync.RWMutex
+	sessions     map[uint64]*Session // SEID -> Session
+	teidMap      map[uint32]uint64   // TEID -> SEID
+	ueIPMap      map[string]uint64   // UE IP string -> primary SEID (for deduplication)
+	remoteSEIDMap map[uint64]uint64  // Remote SEID (from PFCP header) -> our internal SEID
+	seidCounter  uint64              // Counter for generating unique SEIDs
 	// Track session creation timestamps to handle race conditions
 	sessionCreationTime map[string]time.Time // UE IP -> creation time
+	// Timeout checker
+	stopChan chan struct{}
 }
+
+// EstablishmentTimeout is the time to wait before marking a pending session as failed
+const EstablishmentTimeout = 10 * time.Second
 
 // NewCorrelation creates a new correlation store
 func NewCorrelation() *Correlation {
-	return &Correlation{
+	c := &Correlation{
 		sessions:            make(map[uint64]*Session),
 		teidMap:             make(map[uint32]uint64),
 		ueIPMap:             make(map[string]uint64),
+		remoteSEIDMap:       make(map[uint64]uint64),
 		seidCounter:         0,
 		sessionCreationTime: make(map[string]time.Time),
+		stopChan:            make(chan struct{}),
 	}
+	// Start the establishment timeout checker
+	go c.establishmentTimeoutChecker()
+	// Start the data plane status checker
+	go c.dataPlaneStatusChecker()
+	return c
+}
+
+// establishmentTimeoutChecker periodically checks for pending sessions that have timed out
+func (c *Correlation) establishmentTimeoutChecker() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			c.checkEstablishmentTimeouts()
+		}
+	}
+}
+
+// checkEstablishmentTimeouts marks sessions as Failed if they've been Pending too long
+func (c *Correlation) checkEstablishmentTimeouts() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for seid, session := range c.sessions {
+		if session.EstablishmentStatus == EstablishmentPending {
+			if now.Sub(session.EstablishmentTime) > EstablishmentTimeout {
+				log.Printf("[PFCP] Session SEID=0x%x (UE IP=%s) marked as Failed - no modification received within %v",
+					seid, session.UEIP, EstablishmentTimeout)
+				session.EstablishmentStatus = EstablishmentFailed
+				session.Status = "Failed"
+			}
+		}
+	}
+}
+
+// Stop stops the correlation checker
+func (c *Correlation) Stop() {
+	close(c.stopChan)
+}
+
+// dataPlaneStatusChecker periodically checks for stale sessions based on packet activity
+func (c *Correlation) dataPlaneStatusChecker() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			c.checkDataPlaneStatus()
+		}
+	}
+}
+
+// checkDataPlaneStatus updates DataPlaneStatus based on LastPacketTime
+func (c *Correlation) checkDataPlaneStatus() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for _, session := range c.sessions {
+		// Only check established sessions
+		if session.EstablishmentStatus != EstablishmentEstablished {
+			continue
+		}
+
+		// If no packet has ever been seen
+		if session.LastPacketTime.IsZero() {
+			session.DataPlaneStatus = DataPlaneInactive
+			continue
+		}
+
+		// Check if stale (no packets for longer than StaleTimeout)
+		if now.Sub(session.LastPacketTime) > StaleTimeout {
+			if session.DataPlaneStatus != DataPlaneStale {
+				log.Printf("[PFCP] Session SEID=0x%x (UE IP=%s) marked as Stale - no packets for %v",
+					session.SEID, session.UEIP, now.Sub(session.LastPacketTime).Round(time.Second))
+			}
+			session.DataPlaneStatus = DataPlaneStale
+		} else {
+			session.DataPlaneStatus = DataPlaneActive
+		}
+	}
+}
+
+// UpdatePacketActivity updates the LastPacketTime for a session identified by TEID
+// Called when eBPF detects packet activity on a GTP tunnel
+func (c *Correlation) UpdatePacketActivity(teid uint32) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if seid, ok := c.teidMap[teid]; ok {
+		if session, ok := c.sessions[seid]; ok {
+			session.LastPacketTime = time.Now()
+			session.DataPlaneStatus = DataPlaneActive
+			session.LastActive = session.LastPacketTime
+		}
+	}
+}
+
+// UpdatePacketActivityByUEIP updates the LastPacketTime for a session identified by UE IP
+func (c *Correlation) UpdatePacketActivityByUEIP(ueIP string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if seid, ok := c.ueIPMap[ueIP]; ok {
+		if session, ok := c.sessions[seid]; ok {
+			session.LastPacketTime = time.Now()
+			session.DataPlaneStatus = DataPlaneActive
+			session.LastActive = session.LastPacketTime
+		}
+	}
+}
+
+// GetDataPlaneActiveSessions returns sessions with active data plane (recent packets)
+func (c *Correlation) GetDataPlaneActiveSessions() []*Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	sessions := make([]*Session, 0)
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentEstablished &&
+			s.DataPlaneStatus == DataPlaneActive {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+// GetStaleSessions returns sessions that are established but have no recent traffic
+func (c *Correlation) GetStaleSessions() []*Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	sessions := make([]*Session, 0)
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentEstablished &&
+			(s.DataPlaneStatus == DataPlaneStale || s.DataPlaneStatus == DataPlaneInactive) {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+// DataPlaneActiveCount returns count of sessions with active data plane
+func (c *Correlation) DataPlaneActiveCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	count := 0
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentEstablished &&
+			s.DataPlaneStatus == DataPlaneActive {
+			count++
+		}
+	}
+	return count
+}
+
+// StaleSessionCount returns count of stale sessions
+func (c *Correlation) StaleSessionCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	count := 0
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentEstablished &&
+			(s.DataPlaneStatus == DataPlaneStale || s.DataPlaneStatus == DataPlaneInactive) {
+			count++
+		}
+	}
+	return count
+}
+
+// UpdateFromPDRLookupEvent updates session status based on PDR lookup result from eBPF
+// This is called when fentry/fexit hooks detect PDR lookup activity
+// pdrFound: true if PDR was found in gtp5g, false if not
+// teid: the TEID being looked up (for uplink)
+// direction: 0 = uplink (by TEID), 1 = downlink (by IP)
+func (c *Correlation) UpdateFromPDRLookupEvent(pdrFound bool, teid uint32, direction uint8) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// For uplink, we can look up session by TEID
+	if direction == 0 && teid > 0 {
+		if seid, ok := c.teidMap[teid]; ok {
+			if session, ok := c.sessions[seid]; ok {
+				if pdrFound {
+					// PDR found = data plane is working
+					session.DataPlaneStatus = DataPlaneActive
+					session.LastPacketTime = time.Now()
+					session.LastActive = session.LastPacketTime
+				} else {
+					// PDR not found but TEID exists = control/data plane mismatch
+					if session.DataPlaneStatus != DataPlaneStale {
+						log.Printf("[PFCP] Session SEID=0x%x TEID=0x%x: PDR not found in gtp5g (control/data plane mismatch)",
+							seid, teid)
+					}
+				}
+			}
+		}
+	}
+}
+
+// ValidateSessionsAgainstGtp5g validates sessions against gtp5g kernel state
+// Returns a list of sessions with validation discrepancies
+func (c *Correlation) ValidateSessionsAgainstGtp5g(activeTEIDs map[uint32]bool) []uint64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	invalidSEIDs := make([]uint64, 0)
+
+	for seid, session := range c.sessions {
+		if session.EstablishmentStatus != EstablishmentEstablished {
+			continue
+		}
+
+		// Check if any of the session's TEIDs are present in gtp5g
+		hasActiveGtp5gTEID := false
+		for _, teid := range session.TEIDs {
+			if activeTEIDs[teid] {
+				hasActiveGtp5gTEID = true
+				break
+			}
+		}
+
+		if !hasActiveGtp5gTEID && len(session.TEIDs) > 0 {
+			// Session claims to be established but TEIDs not in gtp5g
+			invalidSEIDs = append(invalidSEIDs, seid)
+		}
+	}
+
+	return invalidSEIDs
 }
 
 // getNextSEID generates a sequential SEID for new sessions
@@ -233,9 +549,68 @@ func (c *Correlation) RemoveSession(seid uint64) {
 			delete(c.ueIPMap, ueIPStr)
 			delete(c.sessionCreationTime, ueIPStr)
 		}
+		// Remove from remote SEID map
+		if session.RemoteSEID != 0 {
+			delete(c.remoteSEIDMap, session.RemoteSEID)
+		}
 		delete(c.sessions, seid)
 		log.Printf("[DEBUG] RemoveSession: Removed SEID=0x%x (total sessions: %d)", seid, len(c.sessions))
 	}
+}
+
+// RegisterRemoteSEID registers a remote SEID (from PFCP header) to our internal SEID
+// This enables proper session lookup during Session Deletion per 3GPP TS 29.244
+func (c *Correlation) RegisterRemoteSEID(remoteSEID uint64, internalSEID uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	
+	if remoteSEID != 0 && internalSEID != 0 {
+		c.remoteSEIDMap[remoteSEID] = internalSEID
+		// Also update the session's RemoteSEID field
+		if session, ok := c.sessions[internalSEID]; ok {
+			session.RemoteSEID = remoteSEID
+			log.Printf("[DEBUG] RegisterRemoteSEID: Mapped remote SEID 0x%x -> internal SEID 0x%x", remoteSEID, internalSEID)
+		}
+	}
+}
+
+// GetSessionByRemoteSEID looks up session by remote SEID (from PFCP header)
+func (c *Correlation) GetSessionByRemoteSEID(remoteSEID uint64) (*Session, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	if internalSEID, ok := c.remoteSEIDMap[remoteSEID]; ok {
+		if session, ok := c.sessions[internalSEID]; ok {
+			return session, true
+		}
+	}
+	return nil, false
+}
+
+// RemoveSessionByRemoteSEID removes a session by remote SEID
+func (c *Correlation) RemoveSessionByRemoteSEID(remoteSEID uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if internalSEID, ok := c.remoteSEIDMap[remoteSEID]; ok {
+		if session, ok := c.sessions[internalSEID]; ok {
+			// Clean up all mappings
+			for _, teid := range session.TEIDs {
+				delete(c.teidMap, teid)
+			}
+			if session.UEIP != nil {
+				ueIPStr := session.UEIP.String()
+				delete(c.ueIPMap, ueIPStr)
+				delete(c.sessionCreationTime, ueIPStr)
+			}
+			delete(c.remoteSEIDMap, remoteSEID)
+			delete(c.sessions, internalSEID)
+			log.Printf("[DEBUG] RemoveSessionByRemoteSEID: Removed remote SEID 0x%x (internal 0x%x, total: %d)", 
+				remoteSEID, internalSEID, len(c.sessions))
+			return true
+		}
+	}
+	return false
 }
 
 // GetSessionByTEID looks up session by TEID
@@ -283,11 +658,81 @@ func (c *Correlation) GetAllSessions() []*Session {
 	return sessions
 }
 
-// SessionCount returns the number of active sessions
+// GetActiveSessions returns only successfully established sessions (not failed or pending)
+func (c *Correlation) GetActiveSessions() []*Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	sessions := make([]*Session, 0)
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentEstablished {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+// GetFailedSessions returns sessions that failed to establish
+func (c *Correlation) GetFailedSessions() []*Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	sessions := make([]*Session, 0)
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentFailed {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+// GetPendingSessions returns sessions still waiting for establishment confirmation
+func (c *Correlation) GetPendingSessions() []*Session {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	sessions := make([]*Session, 0)
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentPending {
+			sessions = append(sessions, s)
+		}
+	}
+	return sessions
+}
+
+// SessionCount returns the total number of sessions (all states)
 func (c *Correlation) SessionCount() int {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return len(c.sessions)
+}
+
+// ActiveSessionCount returns only successfully established sessions count
+func (c *Correlation) ActiveSessionCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	count := 0
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentEstablished {
+			count++
+		}
+	}
+	return count
+}
+
+// FailedSessionCount returns the count of failed sessions
+func (c *Correlation) FailedSessionCount() int {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	count := 0
+	for _, s := range c.sessions {
+		if s.EstablishmentStatus == EstablishmentFailed {
+			count++
+		}
+	}
+	return count
 }
 
 // Sniffer captures and parses PFCP packets
@@ -309,15 +754,138 @@ func NewSniffer(iface string, port uint16, correlation *Correlation) *Sniffer {
 	}
 }
 
+// AutoDetectInterface automatically detects the best interface for PFCP capture
+// It checks for common patterns used by free5gc and other 5G deployments
+// Returns the interface name and a description of how it was detected
+func AutoDetectInterface() (string, string) {
+	// Get all available interfaces
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Printf("[AUTO-DETECT] Failed to list interfaces: %v, falling back to 'any'", err)
+		return "any", "fallback (interface enumeration failed)"
+	}
+
+	// Priority 1: Look for Docker bridge interfaces with free5gc-related names
+	// These are the most specific and likely to be correct
+	for _, dev := range devices {
+		name := dev.Name
+		// Check for common free5gc Docker bridge names
+		if name == "br-free5gc" ||
+			strings.HasPrefix(name, "br-free5gc") ||
+			strings.Contains(name, "free5gc") {
+			log.Printf("[AUTO-DETECT] Found free5gc bridge interface: %s", name)
+			return name, "free5gc Docker bridge"
+		}
+	}
+
+	// Priority 2: Look for Docker bridge interfaces (br-*) with IP in common 5G network ranges
+	// free5gc typically uses 10.100.200.0/24, but other setups may vary
+	commonRanges := []string{"10.100.", "10.200.", "10.60.", "10.61.", "192.168.100.", "172."}
+	for _, dev := range devices {
+		if !strings.HasPrefix(dev.Name, "br-") {
+			continue
+		}
+		for _, addr := range dev.Addresses {
+			ip := addr.IP.String()
+			for _, prefix := range commonRanges {
+				if strings.HasPrefix(ip, prefix) {
+					log.Printf("[AUTO-DETECT] Found Docker bridge with 5G network IP: %s (%s)", dev.Name, ip)
+					return dev.Name, fmt.Sprintf("Docker bridge with IP %s", ip)
+				}
+			}
+		}
+	}
+
+	// Priority 3: Look for any Docker bridge interface (br-*)
+	for _, dev := range devices {
+		if strings.HasPrefix(dev.Name, "br-") && dev.Name != "br-lan" {
+			log.Printf("[AUTO-DETECT] Found Docker bridge interface: %s", dev.Name)
+			return dev.Name, "Docker bridge (generic)"
+		}
+	}
+
+	// Priority 4: Look for interfaces with IP in 5G network ranges (non-bridge)
+	// This handles cases where free5gc runs on host networking
+	for _, dev := range devices {
+		// Skip loopback and common non-relevant interfaces
+		if dev.Name == "lo" || strings.HasPrefix(dev.Name, "veth") ||
+			strings.HasPrefix(dev.Name, "docker") || dev.Name == "virbr0" {
+			continue
+		}
+		for _, addr := range dev.Addresses {
+			ip := addr.IP.String()
+			for _, prefix := range commonRanges {
+				if strings.HasPrefix(ip, prefix) {
+					log.Printf("[AUTO-DETECT] Found interface with 5G network IP: %s (%s)", dev.Name, ip)
+					return dev.Name, fmt.Sprintf("interface with IP %s", ip)
+				}
+			}
+		}
+	}
+
+	// Priority 5: Use "any" to capture from all interfaces
+	// This is the safest fallback but may capture irrelevant traffic
+	log.Printf("[AUTO-DETECT] No specific interface found, using 'any' to capture from all interfaces")
+	return "any", "all interfaces (no specific match found)"
+}
+
+// DetectAndListInterfaces lists all available interfaces with their details
+// Useful for debugging and manual configuration
+func DetectAndListInterfaces() []map[string]interface{} {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Printf("[DETECT] Failed to list interfaces: %v", err)
+		return nil
+	}
+
+	result := make([]map[string]interface{}, 0, len(devices))
+	for _, dev := range devices {
+		addresses := make([]string, 0)
+		for _, addr := range dev.Addresses {
+			addresses = append(addresses, addr.IP.String())
+		}
+
+		info := map[string]interface{}{
+			"name":        dev.Name,
+			"description": dev.Description,
+			"addresses":   addresses,
+			"flags":       dev.Flags,
+		}
+		result = append(result, info)
+	}
+	return result
+}
+
 // Start begins capturing PFCP packets
 func (s *Sniffer) Start() error {
 	var err error
 
-	// Open the device for capturing
-	s.handle, err = pcap.OpenLive(s.iface, 65535, true, pcap.BlockForever)
-	if err != nil {
-		return fmt.Errorf("failed to open device %s: %w", s.iface, err)
+	// Auto-detect interface if set to "auto"
+	actualIface := s.iface
+	if s.iface == "auto" || s.iface == "" {
+		detected, reason := AutoDetectInterface()
+		actualIface = detected
+		log.Printf("[PFCP] Auto-detected interface: %s (%s)", actualIface, reason)
 	}
+
+	// Open the device for capturing
+	s.handle, err = pcap.OpenLive(actualIface, 65535, true, pcap.BlockForever)
+	if err != nil {
+		// If the specified interface fails, try "any" as fallback
+		if actualIface != "any" {
+			log.Printf("[PFCP] Failed to open %s: %v, trying 'any' interface", actualIface, err)
+			s.handle, err = pcap.OpenLive("any", 65535, true, pcap.BlockForever)
+			if err != nil {
+				return fmt.Errorf("failed to open any interface: %w", err)
+			}
+			actualIface = "any"
+		} else {
+			return fmt.Errorf("failed to open device %s: %w", actualIface, err)
+		}
+	}
+
+	// Update the interface name to reflect what's actually being used
+	s.iface = actualIface
 
 	// Set BPF filter for PFCP (UDP port 8805)
 	filter := fmt.Sprintf("udp port %d", s.port)
@@ -325,7 +893,7 @@ func (s *Sniffer) Start() error {
 		return fmt.Errorf("failed to set BPF filter: %w", err)
 	}
 
-	log.Printf("PFCP Sniffer started on %s, filter: %s", s.iface, filter)
+	log.Printf("PFCP Sniffer started on %s, filter: %s", actualIface, filter)
 
 	go s.captureLoop()
 
@@ -426,9 +994,10 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 		log.Printf("[PFCP-DEBUG] Session Establishment Request: SEID=0x%x, SMF=%s, UPF=%s, msgLen=%d", seid, srcIP, dstIP, msgLen)
 		s.handleSessionEstablishmentRequest(ieData, dstIP) // dstIP is the UPF receiving this request
 	case MsgTypeSessionEstablishmentResponse:
-		// Response contains the UPF-assigned SEID, but limited data
-		// We'll update existing session if we can match by F-TEID
-		log.Printf("[PFCP-DEBUG] Session Establishment Response: SEID=0x%x (ignored - use Request data)", seid)
+		log.Printf("[PFCP-DEBUG] Session Establishment Response: SEID=0x%x (SMF's SEID)", seid)
+		// Extract UPF's F-SEID from response to map UPF-SEID -> Internal-SEID
+		// This is CRITICAL for Session Deletion, as SMF uses UPF's SEID in Deletion Request
+		s.handleSessionEstablishmentResponse(seid, ieData)
 	case MsgTypeSessionModificationRequest:
 		log.Printf("[PFCP-DEBUG] Session Modification Request: SEID=0x%x, UPF=%s", seid, dstIP)
 		s.handleSessionModification(seid, ieData, dstIP)
@@ -437,6 +1006,12 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 	case MsgTypeSessionDeletionRequest:
 		log.Printf("[PFCP-DEBUG] Session Deletion Request: SEID=0x%x", seid)
 		s.handleSessionDeletion(seid)
+	case MsgTypeSessionDeletionResponse:
+		log.Printf("[PFCP-DEBUG] Session Deletion Response: SEID=0x%x (ignored)", seid)
+	case MsgTypeSessionReportRequest:
+		log.Printf("[PFCP-DEBUG] Session Report Request: SEID=0x%x (ignored)", seid)
+	case MsgTypeSessionReportResponse:
+		log.Printf("[PFCP-DEBUG] Session Report Response: SEID=0x%x (ignored)", seid)
 	default:
 		// Log unknown message types for debugging
 		if hasSessionID {
@@ -467,14 +1042,17 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte, upfIP net.IP)
 
 	// Create new session - always create a new entry for each unique UE IP
 	// The AddSession function will handle deduplication properly
+	now := time.Now()
 	session := &Session{
-		SEID:       0, // Will be assigned by AddSession
-		UEIP:       ueIP,
-		UPFIP:      upfIP, // Set UPF IP from PFCP message destination
-		CreatedAt:  time.Now(),
-		LastActive: time.Now(),
-		TEIDs:      teids,
-		Status:     "Active",
+		SEID:                0, // Will be assigned by AddSession
+		UEIP:                ueIP,
+		UPFIP:               upfIP, // Set UPF IP from PFCP message destination
+		CreatedAt:           now,
+		LastActive:          now,
+		TEIDs:               teids,
+		Status:              "Pending", // Initial status is Pending until modification confirms establishment
+		EstablishmentStatus: EstablishmentPending,
+		EstablishmentTime:   now,
 	}
 
 	// Parse IEs to extract all available info
@@ -486,7 +1064,7 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte, upfIP net.IP)
 	// Add session (will handle deduplication and SEID assignment)
 	s.correlation.AddSession(session)
 
-	log.Printf("   └─ Session created: TEIDs: %v, UE_IP: %v, UPF_IP: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
+	log.Printf("   └─ Session created (Pending): TEIDs: %v, UE_IP: %v, UPF_IP: %v, DNN: %s, QFI: %d, MBR: UL=%d/DL=%d kbps",
 		session.TEIDs, ueIP, upfIP, session.DNN, session.QFI, session.MBRUplink, session.MBRDownlink)
 }
 
@@ -523,14 +1101,25 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP ne
 		log.Printf("   └─ Session not found, creating from modification data with UE IP %s", ueIP.String())
 
 		// Create new session - SEID will be assigned by AddSession
+		// A session created from modification is already established
+		now := time.Now()
 		session = &Session{
-			SEID:       0, // Will be assigned by AddSession
-			UEIP:       ueIP,
-			UPFIP:      upfIP, // Set UPF IP from PFCP message destination
-			CreatedAt:  time.Now(),
-			LastActive: time.Now(),
-			TEIDs:      make([]uint32, 0),
-			Status:     "Active",
+			SEID:                0, // Will be assigned by AddSession
+			UEIP:                ueIP,
+			UPFIP:               upfIP, // Set UPF IP from PFCP message destination
+			CreatedAt:           now,
+			LastActive:          now,
+			TEIDs:               make([]uint32, 0),
+			Status:              "Active",
+			EstablishmentStatus: EstablishmentEstablished,
+			EstablishmentTime:   now,
+		}
+	} else {
+		// Existing session received modification - mark as Established
+		if session.EstablishmentStatus == EstablishmentPending {
+			log.Printf("   └─ Session establishment confirmed (Pending -> Established)")
+			session.EstablishmentStatus = EstablishmentEstablished
+			session.Status = "Active"
 		}
 	}
 
@@ -557,20 +1146,84 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP ne
 	session.LastActive = time.Now()
 	s.correlation.AddSession(session)
 
-	log.Printf("   └─ Updated: TEIDs: %v, UE_IP: %v, UPF_IP: %v, MBR: UL=%d/DL=%d kbps",
-		session.TEIDs, session.UEIP, session.UPFIP, session.MBRUplink, session.MBRDownlink)
+	// Register the PFCP header SEID as a remote SEID for this session
+	// This enables proper session lookup during Session Deletion per 3GPP TS 29.244
+	if seid != 0 && session.SEID != 0 {
+		s.correlation.RegisterRemoteSEID(seid, session.SEID)
+	}
+
+	log.Printf("   └─ Updated: TEIDs: %v, UE_IP: %v, UPF_IP: %v, MBR: UL=%d/DL=%d kbps, Status: %s",
+		session.TEIDs, session.UEIP, session.UPFIP, session.MBRUplink, session.MBRDownlink, session.EstablishmentStatus)
 }
 
 func (s *Sniffer) handleSessionDeletion(seid uint64) {
-	log.Printf("PFCP Session Deletion: SEID=0x%x", seid)
-	// Try to find session by the incoming SEID first
-	if _, ok := s.correlation.GetSessionBySEID(seid); ok {
+	log.Printf("PFCP Session Deletion Request: SEID=0x%x", seid)
+	
+	// Per 3GPP TS 29.244, the SEID in Session Deletion Request is the remote (CP) SEID
+	// We need to look up by remote SEID first, then fall back to internal SEID
+	
+	// Try 1: Look up by remote SEID (most likely match per 3GPP spec)
+	if s.correlation.RemoveSessionByRemoteSEID(seid) {
+		log.Printf("   └─ Removed session by remote SEID 0x%x (3GPP compliant)", seid)
+		return
+	}
+	
+	// Try 2: Look up by internal SEID (fallback for edge cases)
+	if session, ok := s.correlation.GetSessionBySEID(seid); ok {
 		s.correlation.RemoveSession(seid)
-		log.Printf("   └─ Removed session by SEID 0x%x", seid)
-	} else {
-		// Session may have been stored with a different SEID (our sequential one)
-		// This is expected since free5gc's SEID != our internal SEID
-		log.Printf("   └─ Session SEID 0x%x not found in our store (this is normal)", seid)
+		log.Printf("   └─ Removed session by internal SEID 0x%x (UE: %s)", seid, session.UEIP)
+		return
+	}
+	
+	// Session not found - this may happen if we missed the establishment or it was already deleted
+	log.Printf("   └─ Session SEID 0x%x not found (may be stale or already deleted)", seid)
+}
+
+// handleSessionEstablishmentResponse processes Session Establishment Response to capture UPF's F-SEID
+// The header SEID in Response is the SMF's SEID.
+// The UPF's assigned SEID is in the F-SEID IE. We need to map UPF-SEID -> Internal-Session.
+func (s *Sniffer) handleSessionEstablishmentResponse(smfSEID uint64, ieData []byte) {
+	// In Establishment Response (UPF->SMF):
+	// - Header SEID = SMF's SEID (current implementation ignores this mapping)
+	// - F-SEID IE = UPF's SEID (this is what SMF will use for Deletion Request)
+
+	var upfSEID uint64
+	
+	log.Printf("[PFCP-DEBUG] Parsing Establishment Response IEs (len=%d)", len(ieData))
+	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
+		log.Printf("[PFCP-DEBUG] IE Type: %d (len=%d)", ieType, len(ieValue))
+		if ieType == IETypeFSEID {
+			// Parse F-SEID (UPF's SEID)
+			// Flags (1) + SEID (8) + ...
+			log.Printf("[PFCP-DEBUG] Found F-SEID IE: %x", ieValue)
+			if len(ieValue) >= 9 {
+				upfSEID = binary.BigEndian.Uint64(ieValue[1:9])
+				log.Printf("   └─ Found UPF F-SEID: 0x%x", upfSEID)
+			}
+		}
+	})
+	
+	if upfSEID != 0 {
+		// Heuristic: Match with the most recently created PENDING session (within last 5s)
+		// This is necessary because we don't track proper PFCP Transaction IDs yet.
+		sessions := s.correlation.GetAllSessions()
+		var candidate *Session
+		var newestTime time.Time
+		
+		for _, sess := range sessions {
+			if sess.EstablishmentStatus == EstablishmentPending && sess.CreatedAt.After(newestTime) {
+				newestTime = sess.CreatedAt
+				candidate = sess
+			}
+		}
+		
+		if candidate != nil {
+			// Check if created recently (e.g. < 5 seconds)
+			if time.Since(candidate.CreatedAt) < 5*time.Second {
+				log.Printf("   └─ Mapping UPF SEID 0x%x -> Internal SEID 0x%x (for UE %s)", upfSEID, candidate.SEID, candidate.UEIP)
+				s.correlation.RegisterRemoteSEID(upfSEID, candidate.SEID)
+			}
+		}
 	}
 }
 
