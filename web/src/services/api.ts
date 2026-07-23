@@ -5,32 +5,49 @@ export interface TrafficStats {
 }
 
 export interface DirectionStats {
-    packets: number
-    bytes: number
-    throughput_mbps: number
+    packets: number             // cumulative successful PDU packets
+    bytes: number               // cumulative successful PDU bytes
+    packets_per_second: number  // packets/second over the last API sample
+    throughput_mbps: number     // decimal megabits/second
     last_updated: string
 }
 
 export interface DropStats {
     total: number
+    user_plane_total: number
+    infrastructure_total: number
+    uncorrelated_total: number
     rate_percent: number
+    rate_basis: string
     recent_drops: DropEvent[]
     by_reason: Record<string, number>
 }
 
 export interface DropEvent {
     timestamp: string
-    teid: string
-    src_ip: string
-    dst_ip: string
+    kernel_timestamp_ns?: number
+    teid?: string
+    src_ip?: string
+    dst_ip?: string
     src_port?: number
     dst_port?: number
     reason: string
-    direction: string
+    direction: 'uplink' | 'downlink' | 'unknown'
     pkt_len: number
+    family: 'ipv4' | 'ipv6' | 'unknown'
+    protocol: string
+    origin: string
+    icmp_type?: number
+    valid_fields: string[]
+    scope: 'user-plane' | 'infrastructure' | 'uncorrelated'
+    classification: string
+    session_correlated: boolean
+    correlated_observation_id?: string
     // Extended session correlation info (populated by frontend from sessions data)
     session?: {
-        seid?: string
+        observation_id?: string
+        cp_seid?: string
+        up_seid?: string
         ue_ip?: string
         supi?: string
         dnn?: string
@@ -185,13 +202,13 @@ export const DROP_REASON_DATABASE: Record<string, DropReasonInfo> = {
     'GENERAL': {
         code: '7',
         name: 'General Error',
-        description: 'Generic error in gtp5g module from dev.c. Triggered when gtp5g_dev_xmit() fails to forward a packet.',
-        impact: 'Packet dropped during transmission through gtp5g device.',
+        description: 'A generic gtp5g drop was reported. Code 7 is shared by several call sites, so the origin and packet metadata must be used before assigning a specific cause.',
+        impact: 'Impact depends on event scope. Uncorrelated infrastructure events may be harmless; correlated user-plane events require investigation.',
         possibleCauses: [
-            'gtp5g device transmit error',
-            'Packet forwarding failure in gtp5g_handle_skb_ipv4',
-            'No matching PDR for downlink packet',
-            'FAR action processing error'
+            'Unsupported L3 protocol on the gtp5g device',
+            'Socket-buffer preparation failure',
+            'Missing or invalid FAR/OHR forwarding state',
+            'Unhandled forwarding action'
         ],
         suggestedActions: [
             'Check dmesg for gtp5g errors: dmesg | grep -i gtp5g | tail -50',
@@ -200,7 +217,84 @@ export const DROP_REASON_DATABASE: Record<string, DropReasonInfo> = {
             'Review 5G-DPOP sessions: curl localhost:8080/api/v1/sessions'
         ],
         severity: 'warning',
-        layer: 'GTP'
+        layer: 'Kernel'
+    },
+    'UNSUPPORTED_L3': {
+        code: '18',
+        name: 'Unsupported L3 Protocol',
+        description: 'gtp5g_dev_xmit received a non-IPv4 packet. The current gtp5g data path only handles IPv4 payloads.',
+        impact: 'The packet is rejected by the gtp5g interface. Automatic IPv6 control traffic is classified as infrastructure and excluded from the user-plane ratio.',
+        possibleCauses: [
+            'Automatic IPv6 Router Solicitation during interface creation',
+            'IPv6 traffic sent to an IPv4-only PDU session',
+            'Incorrect route directing non-IPv4 traffic to upfgtp'
+        ],
+        suggestedActions: [
+            'Inspect interface addresses: ip address show upfgtp',
+            'Inspect routes: ip -6 route show dev upfgtp',
+            'Disable IPv6 on upfgtp if IPv6 PDU sessions are not supported'
+        ],
+        severity: 'info',
+        layer: 'Kernel'
+    },
+    'SKB_PREPARE_FAIL': {
+        code: '19',
+        name: 'Packet Buffer Preparation Failed',
+        description: 'gtp5g could not reserve the socket-buffer headroom required for encapsulation.',
+        impact: 'A user-plane packet could not be prepared for forwarding.',
+        possibleCauses: ['Kernel memory pressure', 'Invalid device headroom configuration'],
+        suggestedActions: [
+            'Check kernel memory pressure: dmesg | tail -100',
+            'Inspect gtp5g device details: ip -details link show upfgtp'
+        ],
+        severity: 'critical',
+        layer: 'Kernel'
+    },
+    'FAR_MISSING': {
+        code: '20',
+        name: 'FAR Missing',
+        description: 'The matched PDR does not reference an available Forwarding Action Rule.',
+        impact: 'The UPF cannot determine the forwarding action for this packet.',
+        possibleCauses: ['Incomplete PFCP session programming', 'FAR removed before the PDR'],
+        suggestedActions: [
+            'Inspect SMF PFCP logs',
+            'Compare the active PDR and FAR state in gtp5g'
+        ],
+        severity: 'critical',
+        layer: 'PFCP'
+    },
+    'INVALID_FAR_ACTION': {
+        code: '21',
+        name: 'Invalid FAR Action',
+        description: 'The FAR apply-action combination is not handled by the current gtp5g data path.',
+        impact: 'The packet cannot be forwarded or buffered according to the FAR.',
+        possibleCauses: ['Unsupported FAR flag combination', 'Malformed PFCP rule programming'],
+        suggestedActions: [
+            'Inspect FAR apply-action flags in the SMF PFCP trace',
+            'Verify SMF and UPF version compatibility'
+        ],
+        severity: 'critical',
+        layer: 'PFCP'
+    },
+    'OHR_MISSING': {
+        code: '22',
+        name: 'Outer Header Removal Missing',
+        description: 'An uplink rule matched but does not contain the required Outer Header Removal instruction.',
+        impact: 'The UPF cannot remove the incoming GTP-U outer header.',
+        possibleCauses: ['Incomplete uplink PDR', 'PFCP rule programming mismatch'],
+        suggestedActions: ['Inspect the uplink PDR Outer Header Removal IE'],
+        severity: 'critical',
+        layer: 'PFCP'
+    },
+    'OHC_MISSING': {
+        code: '23',
+        name: 'Outer Header Creation Missing',
+        description: 'A forwarding FAR does not contain the required Outer Header Creation information.',
+        impact: 'The UPF cannot construct the outgoing GTP-U tunnel header.',
+        possibleCauses: ['Missing FAR forwarding parameters', 'RAN or peer-UPF endpoint absent from the observed FAR'],
+        suggestedActions: ['Inspect FAR Forwarding Parameters and Outer Header Creation IE'],
+        severity: 'critical',
+        layer: 'PFCP'
     },
     'UL_GATE_CLOSED': {
         code: '8',
@@ -410,9 +504,9 @@ export const DROP_REASON_DATABASE: Record<string, DropReasonInfo> = {
     },
     'UNKNOWN': {
         code: '255',
-        name: 'Unknown Error',
-        description: 'Unknown or unclassified drop reason. Error code not recognized.',
-        impact: 'Packet dropped for unknown reason.',
+        name: 'Unclassified Error Code',
+        description: 'The agent observed a drop code that is not present in its current reason mapping.',
+        impact: 'The packet was dropped; the specific kernel reason cannot be classified from the observed code.',
         possibleCauses: [
             'New error code not yet mapped',
             'gtp5g module version mismatch',
@@ -431,13 +525,15 @@ export const DROP_REASON_DATABASE: Record<string, DropReasonInfo> = {
 }
 
 export interface SessionInfo {
-    // Basic identifiers (backend returns string format)
-    seid: string           // "0x1234" format
-    ue_ip: string
-    teids: string[]        // ["0x1a", "0x1b"] format
-    teid_ul?: string       // Uplink TEID (gNB -> UPF) "0x1a" format
-    teid_dl?: string       // Downlink TEID (UPF -> gNB) "0x1b" format
-    created_at: string     // RFC3339 format "2025-11-29T16:22:12Z"
+    // Evidence-backed identifiers. observation_id is local to this agent and
+    // must never be presented as a PFCP SEID.
+    observation_id: string
+    cp_seid?: string
+    up_seid?: string
+    source?: 'pfcp' | 'demo' | 'manual' | 'log' | string
+    ue_ip?: string
+    local_f_teids?: string[]
+    created_at?: string     // RFC3339 timestamp, only when observed
 
     // Packet statistics
     packets_ul: number
@@ -455,20 +551,60 @@ export interface SessionInfo {
 
     // Network node IPs
     upf_ip?: string
+    upf_n3_ip?: string
     gnb_ip?: string
+    access_peer_ip?: string
+    uplink_peer_ip?: string
+    n9_peer_ip?: string
+    n9_direction?: 'towards-core' | 'towards-access'
+    n9_evidence?: string
+    has_n6?: boolean
+    flow_rules?: FlowRule[]
+    flow_traffic?: FlowTraffic[]
 
     // QoS parameters
-    qos_5qi?: number       // 5QI value
-    arp_priority?: number
     gbr_ul_kbps?: number
     gbr_dl_kbps?: number
     mbr_ul_kbps?: number
     mbr_dl_kbps?: number
 
     // Status
-    status: string
+    status?: string
     duration?: string
     last_active?: string
+    establishment_status?: 'Pending' | 'Established' | 'Failed' | string
+    data_plane_status?: 'Active' | 'Stale' | 'Inactive' | string
+    last_packet_time?: string
+    monitoring_state?: 'active' | 'stale' | 'pending' | 'failed'
+}
+
+export interface FlowRule {
+    pdr_id: number
+    far_id: number
+    precedence: number
+    source_interface: number
+    source_interface_type: number
+    destination_interface: number
+    interface_type: number
+    local_f_teid?: string
+    local_f_teid_ip?: string
+    sdf_observed: boolean
+    sdf?: string
+    destination_selector?: string
+    network_instance?: string
+    outer_dst?: string
+    outer_teid?: string
+    path_type?: 'n3' | 'n6' | 'n9' | 'access-tunnel' | 'tunnel' | 'local'
+}
+
+export interface FlowTraffic {
+    dest_ip: string
+    packets: number
+    bytes: number
+    last_active?: string
+    outer_src?: string
+    outer_dst?: string
+    direction?: string
 }
 
 export interface TopologyNode {
@@ -476,6 +612,11 @@ export interface TopologyNode {
     type: 'ue' | 'gnb' | 'upf' | 'dn'
     label: string
     ip?: string
+    n3_ip?: string
+    n4_ip?: string
+    roles?: string[]
+    role_source?: string
+    confidence?: number
     // Data plane verification status
     verified?: boolean           // Whether verified against gtp5g kernel state
     verifyMethod?: 'gtp5g' | 'pfcp' | 'ebpf' | 'docker'  // Verification source
@@ -492,6 +633,10 @@ export interface TopologyLink {
     hasActiveTraffic?: boolean   // Whether there's active traffic on this link
     trafficRate?: number         // Traffic rate in bytes/sec
     lastSeen?: string            // Timestamp of last traffic
+    evidence?: string
+    confidence?: number
+    flow_selectors?: string[]
+    configured?: boolean
     // Data plane verification status
     verified?: boolean           // Whether verified in gtp5g FAR/PDR
     teid?: string                // Associated TEID for this tunnel
@@ -503,6 +648,14 @@ export interface TopologyLink {
 export interface TopologyData {
     nodes: TopologyNode[]
     links: TopologyLink[]
+    diagnostics?: TopologyDiagnostic[]
+}
+
+export interface TopologyDiagnostic {
+    severity: 'error' | 'warning' | 'info'
+    code: string
+    message: string
+    action: string
 }
 
 // API Functions
@@ -533,11 +686,13 @@ export async function fetchSessions(): Promise<{
     stale_sessions?: SessionInfo[];
     pending_sessions?: SessionInfo[];
     failed_sessions?: SessionInfo[];
+    unclassified_sessions?: SessionInfo[];
     counts?: {
         active: number;
         stale: number;
         pending: number;
         failed: number;
+        unclassified?: number;
     };
 }> {
     const response = await fetch(`${API_BASE}/sessions`)

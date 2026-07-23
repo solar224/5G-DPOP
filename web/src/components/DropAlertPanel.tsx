@@ -1,5 +1,7 @@
 import { useState, useMemo } from 'react'
 import { DropStats, DropEvent, DROP_REASON_DATABASE, DropReasonInfo, SessionInfo } from '../services/api'
+import { formatEnglishDateTime } from '../utils/dateTime'
+import { formatBytes } from '../utils/units'
 
 interface DropAlertPanelProps {
     drops: DropStats
@@ -46,12 +48,6 @@ function getLayerColor(layer: string): string {
     }
 }
 
-// Format packet length
-function formatPktLen(len: number): string {
-    if (len >= 1024) return `${(len / 1024).toFixed(1)} KB`
-    return `${len} B`
-}
-
 // Get direction info
 function getDirectionInfo(direction: string): { icon: string; label: string; path: string; color: string } {
     if (direction === 'uplink') {
@@ -62,32 +58,52 @@ function getDirectionInfo(direction: string): { icon: string; label: string; pat
             color: 'text-green-400'
         }
     }
-    return {
-        icon: '↓',
-        label: 'Downlink',
-        path: 'DN → UPF → gNB → UE',
-        color: 'text-blue-400'
+    if (direction === 'downlink') {
+        return {
+            icon: '↓',
+            label: 'Downlink',
+            path: 'DN → UPF → gNB → UE',
+            color: 'text-blue-400'
+        }
     }
+    return {
+        icon: '↔',
+        label: 'Unclassified direction',
+        path: 'Direction cannot be determined',
+        color: 'text-slate-400'
+    }
+}
+
+function hasValidField(drop: DropEvent, field: string): boolean {
+    return (drop.valid_fields || []).includes(field)
 }
 
 // Correlate drop event with session
 function correlateWithSession(drop: DropEvent, sessions: SessionInfo[]): SessionInfo | undefined {
     if (!sessions || sessions.length === 0) return undefined
 
+    if (drop.correlated_observation_id) {
+        const observationID = drop.correlated_observation_id.toLowerCase()
+        const match = sessions.find(session => session.observation_id.toLowerCase() === observationID)
+        if (match) return match
+    }
+
     // Try to match by TEID first
-    if (drop.teid && drop.teid !== '0x0' && drop.teid !== '0x00000000') {
+    if (hasValidField(drop, 'teid') && drop.teid) {
         const teidValue = drop.teid.toLowerCase()
         for (const session of sessions) {
-            if (session.teids?.some(t => t.toLowerCase() === teidValue)) {
+            if (session.local_f_teids?.some(t => t.toLowerCase() === teidValue)) {
                 return session
             }
         }
     }
 
     // Try to match by UE IP
-    if (drop.src_ip || drop.dst_ip) {
+    if ((hasValidField(drop, 'src_ip') && drop.src_ip) ||
+        (hasValidField(drop, 'dst_ip') && drop.dst_ip)) {
         for (const session of sessions) {
-            if (session.ue_ip === drop.src_ip || session.ue_ip === drop.dst_ip) {
+            if ((hasValidField(drop, 'src_ip') && session.ue_ip === drop.src_ip) ||
+                (hasValidField(drop, 'dst_ip') && session.ue_ip === drop.dst_ip)) {
                 return session
             }
         }
@@ -96,19 +112,27 @@ function correlateWithSession(drop: DropEvent, sessions: SessionInfo[]): Session
     return undefined
 }
 
-// Generate raw log entry format (simulating kernel/agent log)
-function generateRawLog(drop: DropEvent, reasonInfo?: DropReasonInfo): string {
+// Generate a transparent reconstruction from the structured API event.
+function generateEventRecord(drop: DropEvent, reasonInfo?: DropReasonInfo): string {
     const ts = new Date(drop.timestamp).toISOString()
-    const teid = drop.teid || 'N/A'
-    const srcIp = drop.src_ip || '0.0.0.0'
-    const dstIp = drop.dst_ip || '0.0.0.0'
-    const srcPort = drop.src_port || 0
-    const dstPort = drop.dst_port || 0
-    const reasonCode = reasonInfo?.code || '?'
-
-    return `[${ts}] [DROP] reason=${drop.reason}(${reasonCode}) direction=${drop.direction} ` +
-        `teid=${teid} src=${srcIp}:${srcPort} dst=${dstIp}:${dstPort} len=${drop.pkt_len} ` +
-        `layer=${reasonInfo?.layer || 'unknown'}`
+    const fields = [
+        `[${ts}]`,
+        '[DROP]',
+        `reason=${drop.reason}${reasonInfo?.code ? `(${reasonInfo.code})` : ''}`,
+        `direction=${drop.direction}`,
+        hasValidField(drop, 'teid') && drop.teid ? `teid=${drop.teid}` : undefined,
+        hasValidField(drop, 'src_ip') && drop.src_ip ? `src_ip=${drop.src_ip}` : undefined,
+        hasValidField(drop, 'src_port') && drop.src_port !== undefined ? `src_port=${drop.src_port}` : undefined,
+        hasValidField(drop, 'dst_ip') && drop.dst_ip ? `dst_ip=${drop.dst_ip}` : undefined,
+        hasValidField(drop, 'dst_port') && drop.dst_port !== undefined ? `dst_port=${drop.dst_port}` : undefined,
+        `len=${drop.pkt_len}`,
+        `family=${drop.family}`,
+        `protocol=${drop.protocol}`,
+        `origin=${drop.origin}`,
+        `scope=${drop.scope}`,
+        `classification=${drop.classification}`,
+    ]
+    return fields.filter(Boolean).join(' ')
 }
 
 export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }: DropAlertPanelProps) {
@@ -118,6 +142,7 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
     const [viewMode, setViewMode] = useState<'timeline' | 'analysis'>('timeline')
 
     const hasDrops = drops.total > 0
+    const hasUserPlaneDrops = drops.user_plane_total > 0
 
     // Calculate max count for progress bar
     const maxReasonCount = Math.max(...Object.values(drops.by_reason || {}), 1)
@@ -166,27 +191,32 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
     return (
         <div className="space-y-4">
             {/* Summary Header */}
-            <div className={`p-4 rounded-lg ${hasDrops ? 'bg-red-500/10 border border-red-500/20' : 'bg-green-500/10 border border-green-500/20'}`}>
+            <div className={`p-4 rounded-lg ${hasUserPlaneDrops
+                ? 'bg-red-500/10 border border-red-500/20'
+                : hasDrops
+                    ? 'bg-blue-500/10 border border-blue-500/20'
+                    : 'bg-green-500/10 border border-green-500/20'
+                }`}>
                 <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                        <span className={`text-2xl ${hasDrops ? 'pulse-alert' : ''}`}>
-                            {hasDrops ? '⚠️' : '✅'}
+                        <span className={`text-2xl ${hasUserPlaneDrops ? 'pulse-alert' : ''}`}>
+                            {hasUserPlaneDrops ? '⚠️' : hasDrops ? 'ℹ️' : '✅'}
                         </span>
                         <div>
-                            <div className={`font-semibold ${hasDrops ? 'text-red-400' : 'text-green-400'}`}>
-                                {hasDrops ? `${drops.total.toLocaleString()} Drops Detected` : 'No Drops Detected'}
+                            <div className={`font-semibold ${hasUserPlaneDrops ? 'text-red-400' : hasDrops ? 'text-blue-400' : 'text-green-400'}`}>
+                                {hasDrops ? `${drops.total.toLocaleString('en-US')} Drop Events Detected` : 'No Drop Events Detected'}
                             </div>
                             <div className={textSecondary}>
-                                Drop Rate: {drops.rate_percent.toFixed(4)}% | {Object.keys(drops.by_reason || {}).length} unique reasons
+                                User-plane: {drops.user_plane_total} | Infrastructure: {drops.infrastructure_total} | Uncorrelated: {drops.uncorrelated_total}
                             </div>
                         </div>
                     </div>
-                    {hasDrops && (
+                    {hasUserPlaneDrops && (
                         <div className="text-right">
                             <div className="text-2xl font-bold text-red-400">
                                 {drops.rate_percent.toFixed(2)}%
                             </div>
-                            <div className="text-xs text-slate-500">packet loss rate</div>
+                            <div className="text-xs text-slate-500">user-plane event ratio</div>
                         </div>
                     )}
                 </div>
@@ -240,9 +270,11 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                             <div>
                                                 <div className="flex items-center gap-2">
                                                     <span className={`font-medium ${textPrimary}`}>{info?.name || reason}</span>
-                                                    <span className={`text-xs px-2 py-0.5 rounded ${getLayerColor(info?.layer || '')}`}>
-                                                        {info?.layer || 'Unknown'}
-                                                    </span>
+                                                    {info?.layer && (
+                                                        <span className={`text-xs px-2 py-0.5 rounded ${getLayerColor(info.layer)}`}>
+                                                            {info.layer}
+                                                        </span>
+                                                    )}
                                                 </div>
                                                 <div className={`text-xs ${textMuted} mt-0.5`}>
                                                     {info?.description?.substring(0, 80)}...
@@ -252,7 +284,7 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                         <div className="flex items-center gap-3">
                                             <div className="text-right">
                                                 <div className={`text-lg font-bold ${info?.severity === 'critical' ? 'text-red-400' : info?.severity === 'warning' ? 'text-orange-400' : 'text-blue-400'}`}>
-                                                    {count.toLocaleString()}
+                                                    {count.toLocaleString('en-US')}
                                                 </div>
                                                 <div className="text-xs text-slate-500">{percentage.toFixed(1)}%</div>
                                             </div>
@@ -345,7 +377,7 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                 </div>
                                                 <div>
                                                     <span className={textMuted}>Occurrences:</span>
-                                                    <span className="ml-2 font-mono text-cyan-400">{count.toLocaleString()}</span>
+                                                    <span className="ml-2 font-mono text-cyan-400">{count.toLocaleString('en-US')}</span>
                                                 </div>
                                             </div>
                                         </div>
@@ -384,7 +416,20 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                 const reasonInfo = DROP_REASON_DATABASE[drop.reason]
                                 const dirInfo = getDirectionInfo(drop.direction)
                                 const correlatedSession = correlateWithSession(drop, sessions)
-                                const rawLog = generateRawLog(drop, reasonInfo)
+                                const uplinkPath = correlatedSession ? [
+                                    correlatedSession.ue_ip && { label: 'UE', value: correlatedSession.ue_ip },
+                                    correlatedSession.gnb_ip && { label: 'gNB', value: correlatedSession.gnb_ip },
+                                    correlatedSession.upf_ip && { label: 'UPF', value: correlatedSession.upf_ip },
+                                    correlatedSession.dnn && { label: 'DNN', value: correlatedSession.dnn },
+                                ].filter((node): node is { label: string; value: string } => Boolean(node)) : []
+                                const pathNodes = drop.direction === 'downlink' ? [...uplinkPath].reverse() : uplinkPath
+                                const canRenderPath = Boolean(
+                                    correlatedSession &&
+                                    drop.scope === 'user-plane' &&
+                                    drop.direction !== 'unknown' &&
+                                    pathNodes.length >= 2
+                                )
+                                const eventRecord = generateEventRecord(drop, reasonInfo)
 
                                 return (
                                     <div
@@ -415,18 +460,29 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                                     {reasonInfo.layer}
                                                                 </span>
                                                             )}
+                                                            <span className={`text-xs px-2 py-0.5 rounded ${drop.scope === 'user-plane'
+                                                                ? 'bg-red-500/15 text-red-300'
+                                                                : drop.scope === 'infrastructure'
+                                                                    ? 'bg-blue-500/15 text-blue-300'
+                                                                    : 'bg-slate-500/20 text-slate-300'
+                                                                }`}>
+                                                                {drop.scope}
+                                                            </span>
                                                         </div>
                                                         <div className={`text-xs ${textMuted} mt-1`}>
-                                                            {new Date(drop.timestamp).toLocaleString()} | TEID: <span className="font-mono text-cyan-400">{drop.teid}</span>
+                                                            {formatEnglishDateTime(drop.timestamp)}
+                                                            {hasValidField(drop, 'teid') && drop.teid && (
+                                                                <> | TEID: <span className="font-mono text-cyan-400">{drop.teid}</span></>
+                                                            )}
                                                         </div>
                                                     </div>
                                                 </div>
                                                 <div className="flex items-center gap-3">
                                                     <div className="text-right">
                                                         <div className={`text-sm font-mono ${theme === 'dark' ? 'text-slate-300' : 'text-gray-700'}`}>
-                                                            {formatPktLen(drop.pkt_len)}
+                                                            {formatBytes(drop.pkt_len)}
                                                         </div>
-                                                        {correlatedSession && (
+                                                        {drop.session_correlated && correlatedSession && (
                                                             <div className="text-xs text-green-400">📱 Session Found</div>
                                                         )}
                                                     </div>
@@ -443,58 +499,44 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                 {/* Connection Path Visualization */}
                                                 <div className={`p-4 ${codeBg}`}>
                                                     <h4 className={`text-xs font-semibold uppercase tracking-wider ${textMuted} mb-3`}>
-                                                        🔗 Connection Path (Drop Point: {reasonInfo?.layer || 'Unknown'})
+                                                        🔗 {canRenderPath ? 'Correlated Session Path' : 'Event Context'}
                                                     </h4>
-                                                    <div className="flex items-center justify-center gap-2 text-sm">
-                                                        {drop.direction === 'uplink' ? (
-                                                            <>
-                                                                <div className={`px-3 py-2 rounded ${cardBg} border ${borderColor}`}>
-                                                                    <div className="text-xs text-slate-500">Source (UE)</div>
-                                                                    <div className="font-mono text-green-400">{drop.src_ip || 'Unknown'}</div>
-                                                                    {drop.src_port && <div className="text-xs text-slate-500">:{drop.src_port}</div>}
+                                                    {canRenderPath ? (
+                                                        <div className="flex items-center justify-center gap-2 text-sm">
+                                                            {pathNodes.map((node, index) => (
+                                                                <div key={`${node.label}-${node.value}`} className="contents">
+                                                                    {index > 0 && <span className="text-green-400">→</span>}
+                                                                    <div className={`px-3 py-2 rounded ${node.label === 'UPF'
+                                                                        ? 'border-2 border-red-500 bg-red-500/10'
+                                                                        : `${cardBg} border ${borderColor}`
+                                                                        }`}>
+                                                                        <div className="text-xs text-slate-500">{node.label}</div>
+                                                                        <div className="font-mono text-cyan-400">{node.value}</div>
+                                                                        {node.label === 'UPF' && (
+                                                                            <div className="text-xs text-red-400">Observed: {drop.origin}</div>
+                                                                        )}
+                                                                    </div>
                                                                 </div>
-                                                                <span className="text-green-400">→</span>
-                                                                <div className={`px-3 py-2 rounded border-2 ${reasonInfo?.layer === 'GTP' || reasonInfo?.layer === 'PFCP' ? 'border-red-500 bg-red-500/10' : `${cardBg} ${borderColor}`}`}>
-                                                                    <div className="text-xs text-slate-500">UPF</div>
-                                                                    <div className="font-mono text-purple-400">{correlatedSession?.upf_ip || 'N/A'}</div>
-                                                                    {reasonInfo?.layer === 'GTP' || reasonInfo?.layer === 'PFCP' ? (
-                                                                        <div className="text-xs text-red-400">❌ DROP HERE</div>
-                                                                    ) : null}
+                                                            ))}
+                                                        </div>
+                                                    ) : (
+                                                        <div className={`rounded border ${borderColor} ${cardBg} p-3 text-sm`}>
+                                                            <div className="font-medium text-blue-400">
+                                                                No UE session path can be proven for this event
+                                                            </div>
+                                                            <div className={`mt-2 grid grid-cols-2 md:grid-cols-4 gap-3 ${textSecondary}`}>
+                                                                <div><span className={textMuted}>Origin:</span> <span className="font-mono">{drop.origin}</span></div>
+                                                                <div><span className={textMuted}>Scope:</span> {drop.scope}</div>
+                                                                <div><span className={textMuted}>Packet:</span> {drop.family}/{drop.protocol}</div>
+                                                                <div><span className={textMuted}>Class:</span> {drop.classification}</div>
+                                                            </div>
+                                                            {drop.classification === 'ipv6_router_solicitation' && (
+                                                                <div className="mt-2 text-xs text-blue-300">
+                                                                    Automatic IPv6 Router Solicitation from the gtp5g interface; not a UE GTP/PDU-session packet.
                                                                 </div>
-                                                                <span className="text-blue-400">→</span>
-                                                                <div className={`px-3 py-2 rounded border ${reasonInfo?.layer === 'Routing' ? 'border-red-500 bg-red-500/10' : `${cardBg} ${borderColor}`}`}>
-                                                                    <div className="text-xs text-slate-500">Destination (DN)</div>
-                                                                    <div className="font-mono text-blue-400">{drop.dst_ip || 'Unknown'}</div>
-                                                                    {drop.dst_port && <div className="text-xs text-slate-500">:{drop.dst_port}</div>}
-                                                                    {reasonInfo?.layer === 'Routing' ? (
-                                                                        <div className="text-xs text-red-400">❌ DROP HERE</div>
-                                                                    ) : null}
-                                                                </div>
-                                                            </>
-                                                        ) : (
-                                                            <>
-                                                                <div className={`px-3 py-2 rounded ${cardBg} border ${borderColor}`}>
-                                                                    <div className="text-xs text-slate-500">Source (DN)</div>
-                                                                    <div className="font-mono text-blue-400">{drop.src_ip || 'Unknown'}</div>
-                                                                    {drop.src_port && <div className="text-xs text-slate-500">:{drop.src_port}</div>}
-                                                                </div>
-                                                                <span className="text-blue-400">→</span>
-                                                                <div className={`px-3 py-2 rounded border-2 ${reasonInfo?.layer === 'GTP' || reasonInfo?.layer === 'PFCP' ? 'border-red-500 bg-red-500/10' : `${cardBg} ${borderColor}`}`}>
-                                                                    <div className="text-xs text-slate-500">UPF</div>
-                                                                    <div className="font-mono text-purple-400">{correlatedSession?.upf_ip || 'N/A'}</div>
-                                                                    {reasonInfo?.layer === 'GTP' || reasonInfo?.layer === 'PFCP' ? (
-                                                                        <div className="text-xs text-red-400">❌ DROP HERE</div>
-                                                                    ) : null}
-                                                                </div>
-                                                                <span className="text-green-400">→</span>
-                                                                <div className={`px-3 py-2 rounded ${cardBg} border ${borderColor}`}>
-                                                                    <div className="text-xs text-slate-500">Destination (UE)</div>
-                                                                    <div className="font-mono text-green-400">{drop.dst_ip || 'Unknown'}</div>
-                                                                    {drop.dst_port && <div className="text-xs text-slate-500">:{drop.dst_port}</div>}
-                                                                </div>
-                                                            </>
-                                                        )}
-                                                    </div>
+                                                            )}
+                                                        </div>
+                                                    )}
                                                 </div>
 
                                                 {/* Reason Explanation */}
@@ -503,10 +545,18 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                         <h4 className={`text-xs font-semibold uppercase tracking-wider ${textMuted} mb-2`}>
                                                             ❓ Why This Drop Occurred
                                                         </h4>
-                                                        <p className={`text-sm ${textSecondary}`}>{reasonInfo.description}</p>
+                                                        <p className={`text-sm ${textSecondary}`}>
+                                                            {drop.classification === 'ipv6_router_solicitation'
+                                                                ? 'The Linux kernel emitted an automatic ICMPv6 Router Solicitation when the gtp5g interface was created. gtp5g currently accepts IPv4 payloads on this path and reported the IPv6 packet as GENERAL.'
+                                                                : reasonInfo.description}
+                                                        </p>
                                                         <div className={`mt-2 p-2 rounded ${reasonInfo.severity === 'critical' ? 'bg-red-500/10' : reasonInfo.severity === 'warning' ? 'bg-orange-500/10' : 'bg-blue-500/10'}`}>
                                                             <span className="text-xs font-medium">Impact: </span>
-                                                            <span className={`text-xs ${textSecondary}`}>{reasonInfo.impact}</span>
+                                                            <span className={`text-xs ${textSecondary}`}>
+                                                                {drop.scope === 'infrastructure'
+                                                                    ? 'Not counted as a user-plane drop. Investigate only if it repeats outside interface initialization or accompanies UE traffic failure.'
+                                                                    : reasonInfo.impact}
+                                                            </span>
                                                         </div>
                                                     </div>
                                                 )}
@@ -519,39 +569,47 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                         </h4>
                                                         <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
                                                             <div>
-                                                                <span className={textMuted}>SEID:</span>
-                                                                <div className="font-mono text-cyan-400">{correlatedSession.seid}</div>
+                                                                <span className={textMuted}>Observation ID:</span>
+                                                                <div className="font-mono text-cyan-400">{correlatedSession.observation_id}</div>
                                                             </div>
-                                                            <div>
+                                                            {correlatedSession.ue_ip && <div>
                                                                 <span className={textMuted}>UE IP:</span>
                                                                 <div className="font-mono text-green-400">{correlatedSession.ue_ip}</div>
-                                                            </div>
-                                                            <div>
+                                                            </div>}
+                                                            {correlatedSession.cp_seid && <div>
+                                                                <span className={textMuted}>CP F-SEID:</span>
+                                                                <div className="font-mono text-cyan-400">{correlatedSession.cp_seid}</div>
+                                                            </div>}
+                                                            {correlatedSession.up_seid && <div>
+                                                                <span className={textMuted}>UP F-SEID:</span>
+                                                                <div className="font-mono text-cyan-400">{correlatedSession.up_seid}</div>
+                                                            </div>}
+                                                            {correlatedSession.supi && <div>
                                                                 <span className={textMuted}>SUPI:</span>
-                                                                <div className="font-mono text-purple-400">{correlatedSession.supi || 'N/A'}</div>
-                                                            </div>
-                                                            <div>
+                                                                <div className="font-mono text-purple-400">{correlatedSession.supi}</div>
+                                                            </div>}
+                                                            {correlatedSession.dnn && <div>
                                                                 <span className={textMuted}>DNN:</span>
-                                                                <div className="font-mono text-amber-400">{correlatedSession.dnn || 'N/A'}</div>
-                                                            </div>
-                                                            <div>
+                                                                <div className="font-mono text-amber-400">{correlatedSession.dnn}</div>
+                                                            </div>}
+                                                            {correlatedSession.gnb_ip && <div>
                                                                 <span className={textMuted}>gNB IP:</span>
-                                                                <div className="font-mono text-blue-400">{correlatedSession.gnb_ip || 'N/A'}</div>
-                                                            </div>
-                                                            <div>
+                                                                <div className="font-mono text-blue-400">{correlatedSession.gnb_ip}</div>
+                                                            </div>}
+                                                            {correlatedSession.upf_ip && <div>
                                                                 <span className={textMuted}>UPF IP:</span>
-                                                                <div className="font-mono text-purple-400">{correlatedSession.upf_ip || 'N/A'}</div>
-                                                            </div>
-                                                            <div>
+                                                                <div className="font-mono text-purple-400">{correlatedSession.upf_ip}</div>
+                                                            </div>}
+                                                            {Boolean(correlatedSession.qfi) && <div>
                                                                 <span className={textMuted}>QFI:</span>
-                                                                <div className="font-mono text-cyan-400">{correlatedSession.qfi ?? 'N/A'}</div>
-                                                            </div>
-                                                            <div>
+                                                                <div className="font-mono text-cyan-400">{correlatedSession.qfi}</div>
+                                                            </div>}
+                                                            {correlatedSession.status && <div>
                                                                 <span className={textMuted}>Status:</span>
                                                                 <div className={`font-medium ${correlatedSession.status === 'Active' ? 'text-green-400' : 'text-yellow-400'}`}>
                                                                     {correlatedSession.status}
                                                                 </div>
-                                                            </div>
+                                                            </div>}
                                                         </div>
                                                     </div>
                                                 )}
@@ -585,14 +643,17 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                     </div>
                                                 )}
 
-                                                {/* Raw Log */}
+                                                {/* Structured event reconstruction */}
                                                 <div className={`p-4 border-t ${borderColor}`}>
                                                     <h4 className={`text-xs font-semibold uppercase tracking-wider ${textMuted} mb-2`}>
-                                                        📜 Raw Agent Log
+                                                        📜 Reconstructed Event Record
                                                     </h4>
                                                     <pre className={`p-3 rounded text-xs font-mono ${codeBg} overflow-x-auto whitespace-pre-wrap break-all text-slate-300`}>
-                                                        {rawLog}
+                                                        {eventRecord}
                                                     </pre>
+                                                    <div className={`text-xs ${textMuted} mt-1`}>
+                                                        Generated from structured API fields; this is not a verbatim kernel log line.
+                                                    </div>
                                                 </div>
 
                                                 {/* Packet Details */}
@@ -601,29 +662,29 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                         📦 Packet Details
                                                     </h4>
                                                     <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-                                                        <div>
+                                                        {hasValidField(drop, 'teid') && drop.teid && <div>
                                                             <span className={textMuted}>TEID:</span>
                                                             <div className="font-mono text-cyan-400">{drop.teid}</div>
-                                                        </div>
-                                                        <div>
+                                                        </div>}
+                                                        {hasValidField(drop, 'src_ip') && drop.src_ip && <div>
                                                             <span className={textMuted}>Source IP:</span>
                                                             <div className="font-mono text-green-400">{drop.src_ip}</div>
-                                                        </div>
-                                                        <div>
+                                                        </div>}
+                                                        {hasValidField(drop, 'dst_ip') && drop.dst_ip && <div>
                                                             <span className={textMuted}>Dest IP:</span>
                                                             <div className="font-mono text-blue-400">{drop.dst_ip}</div>
-                                                        </div>
+                                                        </div>}
                                                         <div>
                                                             <span className={textMuted}>Packet Size:</span>
                                                             <div className="font-mono text-purple-400">{drop.pkt_len} bytes</div>
                                                         </div>
-                                                        {drop.src_port && (
+                                                        {hasValidField(drop, 'src_port') && (
                                                             <div>
                                                                 <span className={textMuted}>Source Port:</span>
                                                                 <div className="font-mono text-amber-400">{drop.src_port}</div>
                                                             </div>
                                                         )}
-                                                        {drop.dst_port && (
+                                                        {hasValidField(drop, 'dst_port') && (
                                                             <div>
                                                                 <span className={textMuted}>Dest Port:</span>
                                                                 <div className="font-mono text-amber-400">{drop.dst_port}</div>
@@ -632,6 +693,18 @@ export default function DropAlertPanel({ drops, sessions = [], theme = 'dark' }:
                                                         <div>
                                                             <span className={textMuted}>Direction:</span>
                                                             <div className={dirInfo.color}>{dirInfo.path}</div>
+                                                        </div>
+                                                        <div>
+                                                            <span className={textMuted}>Protocol:</span>
+                                                            <div className="font-mono text-slate-300">{drop.family}/{drop.protocol}</div>
+                                                        </div>
+                                                        <div>
+                                                            <span className={textMuted}>Origin Hook:</span>
+                                                            <div className="font-mono text-slate-300">{drop.origin}</div>
+                                                        </div>
+                                                        <div>
+                                                            <span className={textMuted}>Scope:</span>
+                                                            <div className="font-mono text-slate-300">{drop.scope}</div>
                                                         </div>
                                                         <div>
                                                             <span className={textMuted}>Timestamp:</span>

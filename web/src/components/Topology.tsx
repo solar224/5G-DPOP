@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Smartphone, Radio, Server, Globe, HelpCircle } from 'lucide-react'
 import { SessionInfo, DropStats, fetchTopology, TopologyData, TopologyNode } from '../services/api'
+import { formatByteRate, formatBytes } from '../utils/units'
+import { orderTopologyLayers } from '../utils/topologyLayout'
 
 interface TopologyProps {
     sessions: SessionInfo[]
@@ -40,24 +42,65 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
     const tooltipBg = isDark ? 'bg-slate-800' : 'bg-white'
     const tooltipBorder = isDark ? 'border-slate-700' : 'border-slate-200'
     const tooltipText = isDark ? 'text-slate-200' : 'text-slate-700'
+    const diagnostics = topology?.diagnostics || []
+    const diagnosticPanel = diagnostics.length > 0 && (
+        <div className="space-y-2 mb-4">
+            {diagnostics.map(diagnostic => (
+                <div
+                    key={diagnostic.code}
+                    className={`rounded-lg border p-3 text-sm ${diagnostic.severity === 'error'
+                        ? 'border-red-500/50 bg-red-500/10 text-red-300'
+                        : 'border-yellow-500/50 bg-yellow-500/10 text-yellow-300'
+                        }`}
+                >
+                    <div className="font-semibold">
+                        {diagnostic.severity === 'error' ? 'PFCP capture error' : 'Topology warning'}
+                    </div>
+                    <div className="mt-1">{diagnostic.message}</div>
+                    <div className={`mt-1 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                        Action: {diagnostic.action}
+                    </div>
+                </div>
+            ))}
+        </div>
+    )
+    const hasRecentDropForUPF = (node: TopologyNode): boolean => {
+        const nodeIPs = new Set([node.ip, node.n3_ip, node.n4_ip].filter(Boolean))
+
+        return (drops.recent_drops || []).some(drop => {
+            const timestamp = Date.parse(drop.timestamp)
+            if (!Number.isFinite(timestamp) || Date.now() - timestamp > 30_000) return false
+            if (drop.scope !== 'user-plane' || !drop.session_correlated) return false
+
+            const session = sessions.find(candidate => {
+                if (drop.correlated_observation_id &&
+                    candidate.observation_id.toLowerCase() === drop.correlated_observation_id.toLowerCase()) {
+                    return true
+                }
+                return Boolean(drop.teid && candidate.local_f_teids?.some(
+                    teid => teid.toLowerCase() === drop.teid?.toLowerCase()
+                ))
+            })
+            if (!session) return false
+
+            return [session.upf_ip, session.upf_n3_ip].some(ip => ip && nodeIPs.has(ip))
+        })
+    }
 
     if (loading && !topology) {
         return <div className="text-center py-10 text-slate-500">Loading topology...</div>
     }
 
     if (!topology || topology.nodes.length === 0) {
-        return <div className="text-center py-10 text-slate-500">No topology data available</div>
+        return (
+            <div>
+                {diagnosticPanel}
+                <div className="text-center py-10 text-slate-500">No safely correlated topology data available</div>
+            </div>
+        )
     }
 
-    const nodesByType: Record<string, TopologyNode[]> = {
-        'ue': [], 'gnb': [], 'upf': [], 'dn': []
-    }
-    topology.nodes.forEach(n => {
-        if (nodesByType[n.type]) nodesByType[n.type].push(n)
-    })
-    Object.keys(nodesByType).forEach(type => {
-        nodesByType[type].sort((a, b) => a.id.localeCompare(b.id))
-    })
+    const nodesByType = orderTopologyLayers(topology.nodes, topology.links)
 
     const width = 800
     const padding = 30
@@ -66,7 +109,6 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
     const minHeight = 350
     const height = Math.max(minHeight, maxNodes * 120 + padding * 2)
 
-    const layers = ['ue', 'gnb', 'upf', 'dn']
     const layerX = {
         'ue': width * 0.1,
         'gnb': width * 0.35,
@@ -109,13 +151,17 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         }
     }
 
-    const formatBytes = (bytes: number) => {
-        if (bytes === 0) return '0 B'
-        const k = 1024
-        const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
-        const i = Math.floor(Math.log(bytes) / Math.log(k))
-        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+    const sessionsForUPF = (node: TopologyNode) => {
+        const nodeIPs = new Set([node.ip, node.n3_ip, node.n4_ip].filter(Boolean))
+        return sessions.filter(session =>
+            [session.upf_ip, session.upf_n3_ip].some(ip => Boolean(ip && nodeIPs.has(ip)))
+        )
     }
+
+    const activeSessionsForUPF = (node: TopologyNode) =>
+        sessionsForUPF(node).filter(session =>
+            !session.monitoring_state || session.monitoring_state === 'active'
+        )
 
     const getNodeStats = (node: TopologyNode) => {
         const stats = []
@@ -123,28 +169,35 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
         if (node.type === 'ue') {
             const session = sessions.find(s => s.ue_ip === node.ip || s.ue_ip === node.id)
             if (session) {
-                stats.push({ label: 'SUPI', value: session.supi || 'Unknown' })
-                stats.push({ label: 'IP', value: session.ue_ip })
-                stats.push({ label: 'UL Packets', value: session.packets_ul.toLocaleString() })
-                stats.push({ label: 'DL Packets', value: session.packets_dl.toLocaleString() })
+                if (session.supi) stats.push({ label: 'SUPI', value: session.supi })
+                if (session.ue_ip) stats.push({ label: 'IP', value: session.ue_ip })
+                stats.push({ label: 'UL Packets', value: session.packets_ul.toLocaleString('en-US') })
+                stats.push({ label: 'DL Packets', value: session.packets_dl.toLocaleString('en-US') })
                 stats.push({ label: 'UL Bytes', value: formatBytes(session.bytes_ul) })
                 stats.push({ label: 'DL Bytes', value: formatBytes(session.bytes_dl) })
-            } else {
-                stats.push({ label: 'Status', value: 'Idle' })
             }
         } else if (node.type === 'upf') {
-            const totalPackets = sessions.reduce((acc, s) => acc + s.packets_ul + s.packets_dl, 0)
-            const totalBytes = sessions.reduce((acc, s) => acc + s.bytes_ul + s.bytes_dl, 0)
-            stats.push({ label: 'Active Sessions', value: sessions.length })
-            stats.push({ label: 'Total Drops', value: drops.total, alert: drops.total > 0 })
-            stats.push({ label: 'Total Packets', value: totalPackets.toLocaleString() })
-            stats.push({ label: 'Total Traffic', value: formatBytes(totalBytes) })
+            const upfSessions = sessionsForUPF(node)
+            const totalPackets = upfSessions.reduce((acc, s) => acc + s.packets_ul + s.packets_dl, 0)
+            const totalBytes = upfSessions.reduce((acc, s) => acc + s.bytes_ul + s.bytes_dl, 0)
+            if (node.n3_ip || node.ip) stats.push({ label: 'N3 (GTP-U)', value: node.n3_ip || node.ip as string })
+            if (node.n4_ip) stats.push({ label: 'N4 (PFCP)', value: node.n4_ip })
+            if (node.roles?.length) stats.push({ label: 'Roles', value: node.roles.join(', ') })
+            if (node.role_source) stats.push({ label: 'Role source', value: node.role_source })
+            if (node.confidence !== undefined) {
+                stats.push({ label: 'Confidence', value: `${Math.round(node.confidence * 100)}%` })
+            }
+            stats.push({ label: 'Observed Sessions', value: upfSessions.length })
+            stats.push({ label: 'Active Sessions', value: activeSessionsForUPF(node).length })
+            stats.push({ label: 'Total Events', value: drops.total, alert: hasRecentDropForUPF(node) })
+            stats.push({ label: 'Total Packets', value: totalPackets.toLocaleString('en-US') })
+            stats.push({ label: 'PDU Bytes', value: formatBytes(totalBytes) })
         } else if (node.type === 'gnb') {
             const connectedSessions = sessions.filter(s => s.gnb_ip === node.ip)
-            stats.push({ label: 'IP', value: node.ip })
+            if (node.ip) stats.push({ label: 'IP', value: node.ip })
             stats.push({ label: 'Connected UEs', value: connectedSessions.length })
         } else {
-            stats.push({ label: 'IP', value: node.ip || 'N/A' })
+            if (node.ip) stats.push({ label: 'IP', value: node.ip })
         }
 
         return stats
@@ -156,6 +209,7 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
 
     return (
         <div className="w-full overflow-hidden">
+            {diagnosticPanel}
             <div className="w-full relative">
                 <svg
                     viewBox={`0 0 ${width} ${height}`}
@@ -174,6 +228,10 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                         if (!start || !end) return null
 
                         const hasTraffic = link.hasActiveTraffic === true
+                        const selectors = (link.flow_selectors || []).join(', ')
+                        const vertical = Math.abs(start.x - end.x) < 40
+                        const labelX = (start.x + end.x) / 2 + (vertical ? 34 : 0)
+                        const labelY = (start.y + end.y) / 2 + (vertical ? -4 : -8)
 
                         return (
                             <g key={`${link.source}-${link.target}-${idx}`}>
@@ -228,8 +286,8 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                     />
                                 )}
                                 <text
-                                    x={(start.x + end.x) / 2}
-                                    y={(start.y + end.y) / 2 - 8}
+                                    x={labelX}
+                                    y={labelY}
                                     textAnchor="middle"
                                     fill={hasTraffic ? trafficColor : subTextColor}
                                     fontSize="11"
@@ -237,22 +295,29 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                 >
                                     {link.label || link.type.toUpperCase()}
                                 </text>
+                                {selectors && (
+                                    <text
+                                        x={labelX}
+                                        y={labelY + 13}
+                                        textAnchor="middle"
+                                        fill={hasTraffic ? trafficColor : subTextColor}
+                                        fontSize="8"
+                                        fontFamily="monospace"
+                                    >
+                                        {selectors}
+                                    </text>
+                                )}
                                 {/* Show traffic rate when active */}
                                 {(link.trafficRate ?? 0) > 0 && (
                                     <text
-                                        x={(start.x + end.x) / 2}
-                                        y={(start.y + end.y) / 2 + 6}
+                                        x={labelX}
+                                        y={labelY + (selectors ? 25 : 14)}
                                         textAnchor="middle"
                                         fill={hasTraffic ? trafficColor : subTextColor}
                                         fontSize="9"
                                         fontFamily="monospace"
                                     >
-                                        {/* trafficRate is in bytes/sec, convert to appropriate unit */}
-                                        {(link.trafficRate ?? 0) >= 1024 * 1024
-                                            ? `${((link.trafficRate ?? 0) / 1024 / 1024).toFixed(1)} MB/s`
-                                            : (link.trafficRate ?? 0) >= 1024
-                                                ? `${((link.trafficRate ?? 0) / 1024).toFixed(1)} KB/s`
-                                                : `${(link.trafficRate ?? 0).toFixed(0)} B/s`}
+                                        {formatByteRate(link.trafficRate ?? 0)}
                                     </text>
                                 )}
                             </g>
@@ -264,7 +329,7 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                         if (!pos) return null
                         let color = getColor(node.type)
 
-                        const isUpfWithDrops = node.type === 'upf' && drops.total > 0
+                        const isUpfWithDrops = node.type === 'upf' && hasRecentDropForUPF(node)
                         if (isUpfWithDrops) {
                             color = '#ef4444'
                         }
@@ -358,7 +423,7 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                     </g>
                                 )}
                                 {/* Session Count Badge for UPF */}
-                                {node.type === 'upf' && sessions.length > 0 && (
+                                {node.type === 'upf' && activeSessionsForUPF(node).length > 0 && (
                                     <g transform="translate(20, 15)">
                                         <rect
                                             x="-12"
@@ -378,7 +443,7 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                                             fontSize="10"
                                             fontWeight="bold"
                                         >
-                                            {sessions.length}
+                                            {activeSessionsForUPF(node).length}
                                         </text>
                                     </g>
                                 )}
@@ -433,7 +498,7 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                     </div>
                 )}
 
-                <div className={`absolute bottom-4 right-4 p-3 rounded-lg border text-xs ${isDark ? 'bg-slate-800/80 border-slate-700' : 'bg-white/80 border-gray-200'
+                <div className={`mt-3 ml-auto w-fit p-3 rounded-lg border text-xs ${isDark ? 'bg-slate-800/80 border-slate-700' : 'bg-white/80 border-gray-200'
                     }`}>
                     <div className={`font-semibold mb-2 ${isDark ? 'text-slate-300' : 'text-gray-700'}`}>Legend</div>
                     <div className="space-y-1">
@@ -461,7 +526,7 @@ export default function Topology({ sessions, drops, theme = 'dark' }: TopologyPr
                             </div>
                             <div className="flex items-center gap-2">
                                 <span className="w-8 h-0.5 bg-slate-500 opacity-50 rounded"></span>
-                                <span className={isDark ? 'text-slate-400' : 'text-gray-600'}>Idle Path</span>
+                                <span className={isDark ? 'text-slate-400' : 'text-gray-600'}>Configured / Idle Path</span>
                             </div>
                         </div>
                     </div>

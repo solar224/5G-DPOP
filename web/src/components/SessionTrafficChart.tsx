@@ -3,7 +3,8 @@ import {
     BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend,
     PieChart, Pie, Cell, LineChart, Line
 } from 'recharts'
-import { SessionInfo } from '../services/api'
+import { FlowRule, FlowTraffic, SessionInfo } from '../services/api'
+import { formatBytes } from '../utils/units'
 
 interface SessionTrafficChartProps {
     sessions: SessionInfo[]
@@ -12,7 +13,7 @@ interface SessionTrafficChartProps {
 
 interface SessionTrafficData {
     name: string
-    seid: string
+    observationID: string
     ue_ip: string
     uplink: number
     downlink: number
@@ -26,25 +27,55 @@ interface SessionHistoryPoint {
     [key: string]: number | string
 }
 
+interface PathTrafficData {
+    key: string
+    ueIP: string
+    upfIP: string
+    path: string
+    selector: string
+    packets: number
+    bytes: number
+    lastActive?: string
+}
+
+const ipv4Number = (ip: string): number | null => {
+    const parts = ip.split('.').map(Number)
+    if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) {
+        return null
+    }
+    return parts.reduce((value, part) => (value * 256 + part) >>> 0, 0)
+}
+
+const destinationMatches = (ip: string, selector?: string): boolean => {
+    if (!selector) return false
+    const [networkText, prefixText] = selector.split('/')
+    if (!prefixText) return ip === networkText
+    const address = ipv4Number(ip)
+    const network = ipv4Number(networkText)
+    const prefix = Number(prefixText)
+    if (address === null || network === null || prefix < 0 || prefix > 32) return false
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0
+    return (address & mask) === (network & mask)
+}
+
+const flowMatchesRule = (
+    flow: FlowTraffic,
+    rule: FlowRule,
+    allRules: FlowRule[]
+): boolean => {
+    if (rule.destination_selector) {
+        return destinationMatches(flow.dest_ip, rule.destination_selector)
+    }
+    return !allRules.some(candidate =>
+        Boolean(candidate.destination_selector) &&
+        destinationMatches(flow.dest_ip, candidate.destination_selector)
+    )
+}
+
 const COLORS = [
     '#22c55e', '#3b82f6', '#f59e0b', '#ef4444', '#8b5cf6',
     '#06b6d4', '#ec4899', '#14b8a6', '#f97316', '#6366f1'
 ]
-
-function formatBytes(bytes: number): string {
-    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`
-    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(2)} MB`
-    if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(2)} KB`
-    return `${bytes} B`
-}
-
-function formatThroughput(bytes: number, seconds: number = 1): string {
-    const bps = (bytes * 8) / seconds
-    if (bps >= 1e9) return `${(bps / 1e9).toFixed(2)} Gbps`
-    if (bps >= 1e6) return `${(bps / 1e6).toFixed(2)} Mbps`
-    if (bps >= 1e3) return `${(bps / 1e3).toFixed(2)} Kbps`
-    return `${bps.toFixed(0)} bps`
-}
 
 type ViewMode = 'bar' | 'pie' | 'trend'
 
@@ -74,8 +105,8 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
         return sessions
             .map((session, index) => ({
                 name: `UE ${index + 1}`,
-                seid: session.seid,
-                ue_ip: session.ue_ip,
+                observationID: session.observation_id,
+                ue_ip: session.ue_ip || session.observation_id,
                 uplink: session.bytes_ul || 0,
                 downlink: session.bytes_dl || 0,
                 total: (session.bytes_ul || 0) + (session.bytes_dl || 0),
@@ -94,11 +125,13 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
             const newHistory = new Map(prev)
 
             sessions.forEach(session => {
-                const key = session.seid
+                const key = session.observation_id
                 const totalBytes = (session.bytes_ul || 0) + (session.bytes_dl || 0)
 
-                const history = newHistory.get(key) || []
-                history.push({ bytes: totalBytes, time: now })
+                const history = [
+                    ...(newHistory.get(key) || []),
+                    { bytes: totalBytes, time: now },
+                ]
 
                 // Keep only last 60 seconds
                 const cutoff = now - 60000
@@ -126,14 +159,14 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                 })
             }
 
-            // Find bytes for each session at this time
+            // Cumulative bytes are a step counter. Use only a sample observed
+            // at or before this bucket; never project the newest value backward
+            // into time where no sample existed.
             sessions.slice(0, 5).forEach((session, idx) => {
-                const history = sessionHistory.get(session.seid) || []
-                // Find closest data point
-                const closest = history.reduce((prev, curr) => {
-                    return Math.abs(curr.time - bucketTime) < Math.abs(prev.time - bucketTime) ? curr : prev
-                }, { bytes: 0, time: 0 })
-                point[`session${idx}`] = closest.bytes
+                const history = sessionHistory.get(session.observation_id) || []
+                const priorSamples = history.filter(sample => sample.time <= bucketTime)
+                const observed = priorSamples[priorSamples.length - 1]
+                if (observed) point[`session${idx}`] = observed.bytes
             })
 
             points.push(point)
@@ -165,12 +198,55 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
         )
     }, [sessionData])
 
+    // PFCP rules describe configured paths; eBPF inner-PDU observations supply
+    // per-destination counters. Values are per UPF hop, not end-to-end totals.
+    const pathTraffic = useMemo<PathTrafficData[]>(() => {
+        const rows: PathTrafficData[] = []
+        sessions.forEach(session => {
+            const upfIP = session.upf_ip
+            if (!upfIP) return
+            const rules = (session.flow_rules || []).filter(rule =>
+                rule.path_type === 'n6' || rule.path_type === 'n9'
+            )
+            rules.forEach(rule => {
+                const matchingFlows = (session.flow_traffic || []).filter(flow =>
+                    flow.direction === 'uplink' &&
+                    flowMatchesRule(flow, rule, rules)
+                )
+                const selector = rule.destination_selector ||
+                    (rule.sdf_observed === false ? 'All traffic (no SDF filter)' : '')
+                const target = rule.path_type === 'n9'
+                    ? [rule.outer_dst || session.n9_peer_ip].filter(Boolean).length > 0
+                        ? `N9 → ${rule.outer_dst || session.n9_peer_ip}`
+                        : 'N9'
+                    : [rule.destination_selector || rule.network_instance || session.dnn].filter(Boolean).length > 0
+                        ? `N6 → ${rule.destination_selector || rule.network_instance || session.dnn}`
+                        : 'N6'
+                rows.push({
+                    key: `${upfIP}:${session.observation_id}:${rule.pdr_id}`,
+                    ueIP: session.ue_ip || session.observation_id,
+                    upfIP,
+                    path: target,
+                    selector,
+                    packets: matchingFlows.reduce((total, flow) => total + flow.packets, 0),
+                    bytes: matchingFlows.reduce((total, flow) => total + flow.bytes, 0),
+                    lastActive: matchingFlows
+                        .map(flow => flow.last_active)
+                        .filter((value): value is string => Boolean(value))
+                        .sort()
+                        .slice(-1)[0],
+                })
+            })
+        })
+        return rows.sort((a, b) => b.bytes - a.bytes || a.key.localeCompare(b.key))
+    }, [sessions])
+
     if (sessions.length === 0) {
         return (
             <div className={`h-80 flex items-center justify-center ${mutedText}`}>
                 <div className="text-center">
                     <div className="text-4xl mb-2">📊</div>
-                    <p>No active sessions</p>
+                    <p>No observed sessions</p>
                     <p className={`text-sm mt-1 ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>Session traffic will appear here</p>
                 </div>
             </div>
@@ -193,7 +269,7 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                                     : buttonText
                                     }`}
                             >
-                                {mode === 'bar' ? '📊 Bar' : mode === 'pie' ? '🥧 Pie' : '📈 Trend'}
+                                {mode === 'bar' ? '📊 Bar' : mode === 'pie' ? '🥧 Pie' : '📈 Cumulative'}
                             </button>
                         ))}
                     </div>
@@ -207,7 +283,7 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                             onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
                             className={`${selectBg} ${textPrimary} text-sm rounded-lg px-3 py-1 border`}
                         >
-                            <option value="total">Total Traffic</option>
+                            <option value="total">Total PDU Bytes</option>
                             <option value="uplink">Uplink</option>
                             <option value="downlink">Downlink</option>
                         </select>
@@ -218,11 +294,11 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
             {/* Summary Stats */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
                 <div className={`${cardBg} rounded-lg p-3`}>
-                    <div className={`text-xs ${mutedText}`}>Total Sessions</div>
+                    <div className={`text-xs ${mutedText}`}>Observed UPF Sessions</div>
                     <div className={`text-xl font-bold ${textPrimary}`}>{sessions.length}</div>
                 </div>
                 <div className={`${cardBg} rounded-lg p-3`}>
-                    <div className={`text-xs ${mutedText}`}>Total Traffic</div>
+                    <div className={`text-xs ${mutedText}`}>Summed UPF-Hop PDU Bytes</div>
                     <div className={`text-xl font-bold ${textPrimary}`}>{formatBytes(totals.total)}</div>
                 </div>
                 <div className={`${cardBg} rounded-lg p-3`}>
@@ -234,6 +310,57 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                     <div className="text-xl font-bold text-blue-400">{formatBytes(totals.downlink)}</div>
                 </div>
             </div>
+
+            {pathTraffic.length > 0 && (
+                <div>
+                    <div className="flex items-baseline justify-between gap-3 mb-2">
+                        <h4 className={`text-sm font-medium ${theme === 'dark' ? 'text-slate-300' : 'text-gray-700'}`}>
+                            ULCL Path Traffic
+                        </h4>
+                        <span className={`text-xs ${mutedText}`}>
+                            Uplink inner-PDU observations per UPF hop
+                        </span>
+                    </div>
+                    <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                            <thead>
+                                <tr className={`${mutedText} border-b ${tableBorder}`}>
+                                    <th className="text-left py-2 px-2">UE</th>
+                                    <th className="text-left py-2 px-2">Local UPF</th>
+                                    <th className="text-left py-2 px-2">PFCP selector</th>
+                                    <th className="text-left py-2 px-2">Packet path</th>
+                                    <th className="text-right py-2 px-2">Packets</th>
+                                    <th className="text-right py-2 px-2">PDU bytes</th>
+                                    <th className="text-center py-2 px-2">State</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {pathTraffic.map(row => {
+                                    const active = Boolean(
+                                        row.lastActive &&
+                                        Date.now() - Date.parse(row.lastActive) < 10_000
+                                    )
+                                    return (
+                                        <tr key={row.key} className={`border-b ${tableBorder}/50 ${tableHover}`}>
+                                            <td className="py-2 px-2 font-mono text-cyan-400">{row.ueIP}</td>
+                                            <td className="py-2 px-2 font-mono">{row.upfIP}</td>
+                                            <td className="py-2 px-2 font-mono text-amber-400">{row.selector}</td>
+                                            <td className="py-2 px-2">{row.path}</td>
+                                            <td className="py-2 px-2 text-right font-mono">{row.packets.toLocaleString('en-US')}</td>
+                                            <td className="py-2 px-2 text-right font-mono">{formatBytes(row.bytes)}</td>
+                                            <td className="py-2 px-2 text-center">
+                                                <span className={active ? 'text-green-400' : mutedText}>
+                                                    {active ? 'Active' : row.packets > 0 ? 'Idle' : 'Configured'}
+                                                </span>
+                                            </td>
+                                        </tr>
+                                    )
+                                })}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            )}
 
             {/* Chart */}
             <div className="h-72">
@@ -322,6 +449,7 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                                 stroke={axisColor}
                                 fontSize={11}
                                 tickFormatter={(value) => formatBytes(value)}
+                                label={{ value: 'Cumulative PDU bytes', angle: -90, position: 'insideLeft', style: { fill: axisColor, fontSize: 10 } }}
                             />
                             <Tooltip
                                 contentStyle={{
@@ -330,15 +458,15 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                                     borderRadius: '8px',
                                 }}
                                 labelStyle={{ color: textColor }}
-                                formatter={(value: number) => [formatBytes(value)]}
+                                formatter={(value: number) => [formatBytes(value), 'Cumulative PDU bytes']}
                             />
                             <Legend />
                             {sessions.slice(0, 5).map((session, idx) => (
                                 <Line
-                                    key={session.seid}
+                                    key={session.observation_id}
                                     type="monotone"
                                     dataKey={`session${idx}`}
-                                    name={session.ue_ip}
+                                    name={session.ue_ip || session.observation_id}
                                     stroke={COLORS[idx % COLORS.length]}
                                     strokeWidth={2}
                                     dot={false}
@@ -359,12 +487,12 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                             <tr className={`${mutedText} border-b ${tableBorder}`}>
                                 <th className="text-left py-2 px-2">#</th>
                                 <th className="text-left py-2 px-2">UE IP</th>
-                                <th className="text-left py-2 px-2">SEID</th>
+                                <th className="text-left py-2 px-2">Observation ID</th>
                                 <th className="text-right py-2 px-2">↑ UL Bytes</th>
                                 <th className="text-right py-2 px-2">↓ DL Bytes</th>
                                 <th className="text-right py-2 px-2">↑ UL Pkts</th>
                                 <th className="text-right py-2 px-2">↓ DL Pkts</th>
-                                <th className="text-right py-2 px-2">Total</th>
+                                <th className="text-right py-2 px-2">Total Bytes</th>
                                 <th className="text-center py-2 px-2">Share</th>
                             </tr>
                         </thead>
@@ -375,7 +503,7 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                                     : 0
                                 return (
                                     <tr
-                                        key={session.seid}
+                                        key={session.observationID}
                                         className={`border-b ${tableBorder}/50 ${tableHover}`}
                                     >
                                         <td className="py-2 px-2">
@@ -385,7 +513,7 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                                             />
                                         </td>
                                         <td className="py-2 px-2 font-mono text-cyan-400">{session.ue_ip}</td>
-                                        <td className={`py-2 px-2 font-mono text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>{session.seid}</td>
+                                        <td className={`py-2 px-2 font-mono text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>{session.observationID}</td>
                                         <td className="py-2 px-2 text-right font-mono text-green-400">
                                             {formatBytes(session.uplink)}
                                         </td>
@@ -393,10 +521,10 @@ export default function SessionTrafficChart({ sessions, theme = 'dark' }: Sessio
                                             {formatBytes(session.downlink)}
                                         </td>
                                         <td className="py-2 px-2 text-right font-mono text-green-400/70">
-                                            {session.packetsUL.toLocaleString()}
+                                            {session.packetsUL.toLocaleString('en-US')}
                                         </td>
                                         <td className="py-2 px-2 text-right font-mono text-blue-400/70">
-                                            {session.packetsDL.toLocaleString()}
+                                            {session.packetsDL.toLocaleString('en-US')}
                                         </td>
                                         <td className={`py-2 px-2 text-right font-mono ${textPrimary} font-medium`}>
                                             {formatBytes(session.total)}

@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -16,12 +18,20 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-const (
-	// Agent endpoints
-	agentMetricsURL  = "http://localhost:9100/metrics"
-	agentDropsURL    = "http://localhost:9100/api/drops"
-	agentSessionsURL = "http://localhost:9100/api/sessions"
+var (
+	agentBaseURL       = strings.TrimRight(envOrDefault("DPOP_AGENT_URL", "http://localhost:9100"), "/")
+	agentMetricsURL    = agentBaseURL + "/metrics"
+	agentDropsURL      = agentBaseURL + "/api/drops"
+	agentSessionsURL   = agentBaseURL + "/api/sessions"
+	agentInterfacesURL = agentBaseURL + "/api/interfaces?compact=1"
 )
+
+func envOrDefault(key, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+		return value
+	}
+	return fallback
+}
 
 // TrafficStats represents traffic statistics
 type TrafficStats struct {
@@ -31,31 +41,46 @@ type TrafficStats struct {
 
 // DirectionStats represents stats for a single direction
 type DirectionStats struct {
-	Packets     uint64  `json:"packets"`
-	Bytes       uint64  `json:"bytes"`
-	Throughput  float64 `json:"throughput_mbps"`
-	LastUpdated string  `json:"last_updated"`
+	Packets          uint64  `json:"packets"`            // cumulative successful PDU packets
+	Bytes            uint64  `json:"bytes"`              // cumulative successful PDU bytes
+	PacketsPerSecond float64 `json:"packets_per_second"` // packets/second over the last sample
+	Throughput       float64 `json:"throughput_mbps"`    // decimal megabits/second
+	LastUpdated      string  `json:"last_updated"`
 }
 
 // DropStats represents drop statistics
 type DropStats struct {
-	Total       uint64            `json:"total"`
-	Rate        float64           `json:"rate_percent"`
-	RecentDrops []DropEvent       `json:"recent_drops"`
-	ByReason    map[string]uint64 `json:"by_reason"`
+	Total               uint64            `json:"total"`
+	UserPlaneTotal      uint64            `json:"user_plane_total"`
+	InfrastructureTotal uint64            `json:"infrastructure_total"`
+	UncorrelatedTotal   uint64            `json:"uncorrelated_total"`
+	Rate                float64           `json:"rate_percent"`
+	RateBasis           string            `json:"rate_basis"`
+	RecentDrops         []DropEvent       `json:"recent_drops"`
+	ByReason            map[string]uint64 `json:"by_reason"`
 }
 
 // DropEvent represents a single drop event
 type DropEvent struct {
-	Timestamp string `json:"timestamp"`
-	TEID      string `json:"teid"`
-	SrcIP     string `json:"src_ip"`
-	DstIP     string `json:"dst_ip"`
-	SrcPort   uint16 `json:"src_port"`
-	DstPort   uint16 `json:"dst_port"`
-	Reason    string `json:"reason"`
-	Direction string `json:"direction"`
-	PktLen    uint32 `json:"pkt_len"`
+	Timestamp               string   `json:"timestamp"`
+	KernelTimestampNS       uint64   `json:"kernel_timestamp_ns"`
+	TEID                    string   `json:"teid,omitempty"`
+	SrcIP                   string   `json:"src_ip,omitempty"`
+	DstIP                   string   `json:"dst_ip,omitempty"`
+	SrcPort                 uint16   `json:"src_port,omitempty"`
+	DstPort                 uint16   `json:"dst_port,omitempty"`
+	Reason                  string   `json:"reason"`
+	Direction               string   `json:"direction"`
+	PktLen                  uint32   `json:"pkt_len"`
+	Family                  string   `json:"family"`
+	Protocol                string   `json:"protocol"`
+	Origin                  string   `json:"origin"`
+	ICMPType                uint8    `json:"icmp_type,omitempty"`
+	ValidFields             []string `json:"valid_fields"`
+	Scope                   string   `json:"scope"`
+	Classification          string   `json:"classification"`
+	SessionCorrelated       bool     `json:"session_correlated"`
+	CorrelatedObservationID string   `json:"correlated_observation_id,omitempty"`
 }
 
 // FlowTraffic represents per-destination traffic for ULCL path differentiation
@@ -64,29 +89,61 @@ type FlowTraffic struct {
 	Packets    uint64 `json:"packets"`
 	Bytes      uint64 `json:"bytes"`
 	LastActive string `json:"last_active,omitempty"`
-	OuterDst   string `json:"outer_dst,omitempty"` // Next hop UPF or gateway
+	OuterSrc   string `json:"outer_src,omitempty"`
+	OuterDst   string `json:"outer_dst,omitempty"` // Local GTP-U ingress endpoint
+	Direction  string `json:"direction,omitempty"`
+}
+
+// FlowRule is a PFCP PDR joined with its FAR. It describes the configured path
+// independently of whether traffic has recently been observed on that path.
+type FlowRule struct {
+	PDRID                uint16 `json:"pdr_id"`
+	FARID                uint32 `json:"far_id"`
+	Precedence           uint32 `json:"precedence"`
+	SourceInterface      int    `json:"source_interface"`
+	SourceInterfaceType  int    `json:"source_interface_type"`
+	DestinationInterface int    `json:"destination_interface"`
+	InterfaceType        int    `json:"interface_type"`
+	LocalFTEID           string `json:"local_f_teid,omitempty"`
+	LocalFTEIDIP         string `json:"local_f_teid_ip,omitempty"`
+	SDFObserved          bool   `json:"sdf_observed"`
+	SDF                  string `json:"sdf,omitempty"`
+	DestinationSelector  string `json:"destination_selector,omitempty"`
+	NetworkInstance      string `json:"network_instance,omitempty"`
+	OuterDst             string `json:"outer_dst,omitempty"`
+	OuterTEID            string `json:"outer_teid,omitempty"`
+	PathType             string `json:"path_type,omitempty"`
 }
 
 // SessionInfo represents a PDU session (extended)
 type SessionInfo struct {
-	SEID      string   `json:"seid"`
-	UEIP      string   `json:"ue_ip"`
-	TEIDs     []string `json:"teids"`
-	CreatedAt string   `json:"created_at"`
-	PacketsUL uint64   `json:"packets_ul"`
-	PacketsDL uint64   `json:"packets_dl"`
+	ObservationID string   `json:"observation_id"`
+	CPSEID        string   `json:"cp_seid,omitempty"`
+	UPSEID        string   `json:"up_seid,omitempty"`
+	Source        string   `json:"source,omitempty"`
+	UEIP          string   `json:"ue_ip,omitempty"`
+	LocalFTEIDs   []string `json:"local_f_teids,omitempty"`
+	CreatedAt     string   `json:"created_at,omitempty"`
+	PacketsUL     uint64   `json:"packets_ul"`
+	PacketsDL     uint64   `json:"packets_dl"`
 
 	// Extended fields
-	UPFIP        string `json:"upf_ip,omitempty"`
-	GNBIP        string `json:"gnb_ip,omitempty"`
-	UplinkPeerIP string `json:"uplink_peer_ip,omitempty"`
-	N9PeerIP     string `json:"n9_peer_ip,omitempty"` // N9 peer UPF IP (for ULCL)
-	SUPI         string `json:"supi,omitempty"`
-	DNN          string `json:"dnn,omitempty"`
-	SNssai       string `json:"s_nssai,omitempty"`
-	QFI          uint8  `json:"qfi,omitempty"`
-	SessionType  string `json:"session_type,omitempty"`
-	SessionID    uint8  `json:"pdu_session_id,omitempty"`
+	UPFIP        string     `json:"upf_ip,omitempty"`
+	UPFN3IP      string     `json:"upf_n3_ip,omitempty"`
+	GNBIP        string     `json:"gnb_ip,omitempty"`
+	AccessPeerIP string     `json:"access_peer_ip,omitempty"`
+	UplinkPeerIP string     `json:"uplink_peer_ip,omitempty"`
+	N9PeerIP     string     `json:"n9_peer_ip,omitempty"` // N9 peer UPF IP (for ULCL)
+	N9Direction  string     `json:"n9_direction,omitempty"`
+	N9Evidence   string     `json:"n9_evidence,omitempty"`
+	HasN6        bool       `json:"has_n6,omitempty"`
+	FlowRules    []FlowRule `json:"flow_rules,omitempty"`
+	SUPI         string     `json:"supi,omitempty"`
+	DNN          string     `json:"dnn,omitempty"`
+	SNssai       string     `json:"s_nssai,omitempty"`
+	QFI          uint8      `json:"qfi,omitempty"`
+	SessionType  string     `json:"session_type,omitempty"`
+	SessionID    uint8      `json:"pdu_session_id,omitempty"`
 
 	// Traffic statistics
 	BytesUL uint64 `json:"bytes_ul"`
@@ -96,15 +153,13 @@ type SessionInfo struct {
 	FlowTraffic []FlowTraffic `json:"flow_traffic,omitempty"`
 
 	// QoS parameters
-	QoS5QI      uint8  `json:"qos_5qi,omitempty"`
-	ARPPL       uint8  `json:"arp_priority,omitempty"`
 	GBRUplink   uint64 `json:"gbr_ul_kbps,omitempty"`
 	GBRDownlink uint64 `json:"gbr_dl_kbps,omitempty"`
 	MBRUplink   uint64 `json:"mbr_ul_kbps,omitempty"`
 	MBRDownlink uint64 `json:"mbr_dl_kbps,omitempty"`
 
 	// Status
-	Status              string `json:"status"`
+	Status              string `json:"status,omitempty"`
 	Duration            string `json:"duration,omitempty"`
 	LastActive          string `json:"last_active,omitempty"`
 	EstablishmentStatus string `json:"establishment_status,omitempty"` // Pending, Established, Failed
@@ -123,13 +178,32 @@ type Server struct {
 	broadcast chan interface{}
 
 	// In-memory stats (will be replaced with Prometheus queries)
-	stats           TrafficStats
-	drops           DropStats
-	sessions        []SessionInfo // Active data plane sessions
-	staleSessions   []SessionInfo // Established but no recent traffic
-	failedSessions  []SessionInfo // Failed establishment sessions
-	pendingSessions []SessionInfo // Pending sessions (waiting for confirmation)
-	statsMu         sync.RWMutex
+	stats                TrafficStats
+	drops                DropStats
+	sessions             []SessionInfo // Active data plane sessions
+	staleSessions        []SessionInfo // Established but no recent traffic
+	failedSessions       []SessionInfo // Failed establishment sessions
+	pendingSessions      []SessionInfo // Pending sessions (waiting for confirmation)
+	unclassifiedSessions []SessionInfo // Session evidence without a measured monitoring state
+	sessionSamples       map[string]sessionCounterSample
+	sessionRates         map[string]float64 // current PDU bytes per second
+	flowSamples          map[string]sessionCounterSample
+	flowRates            map[string]float64 // current observed uplink PDU bytes per second
+	captureStatus        AgentInterfaceStatus
+	statsMu              sync.RWMutex
+}
+
+type AgentInterfaceStatus struct {
+	RequestedConfig string `json:"requested_config"`
+	CurrentConfig   string `json:"current_config"`
+	ActiveCapture   string `json:"active_capture"`
+	AutoDetected    string `json:"auto_detected"`
+	DetectionReason string `json:"detection_reason"`
+}
+
+type sessionCounterSample struct {
+	bytes uint64
+	at    time.Time
 }
 
 func main() {
@@ -160,10 +234,15 @@ func NewServer() *Server {
 			RecentDrops: make([]DropEvent, 0),
 			ByReason:    make(map[string]uint64),
 		},
-		sessions:        make([]SessionInfo, 0),
-		staleSessions:   make([]SessionInfo, 0),
-		failedSessions:  make([]SessionInfo, 0),
-		pendingSessions: make([]SessionInfo, 0),
+		sessions:             make([]SessionInfo, 0),
+		staleSessions:        make([]SessionInfo, 0),
+		failedSessions:       make([]SessionInfo, 0),
+		pendingSessions:      make([]SessionInfo, 0),
+		unclassifiedSessions: make([]SessionInfo, 0),
+		sessionSamples:       make(map[string]sessionCounterSample),
+		sessionRates:         make(map[string]float64),
+		flowSamples:          make(map[string]sessionCounterSample),
+		flowRates:            make(map[string]float64),
 	}
 
 	s.setupRoutes()
@@ -193,7 +272,7 @@ func (s *Server) setupRoutes() {
 		api.GET("/metrics/traffic", s.handleTrafficMetrics)
 		api.GET("/metrics/drops", s.handleDropMetrics)
 		api.GET("/sessions", s.handleSessions)
-		api.GET("/sessions/:seid", s.handleSessionDetail)
+		api.GET("/sessions/:observation_id", s.handleSessionDetail)
 		api.GET("/topology", s.handleTopology)
 		api.POST("/fault/inject", s.handleFaultInject)
 
@@ -238,30 +317,33 @@ func (s *Server) handleSessions(c *gin.Context) {
 	defer s.statsMu.RUnlock()
 
 	c.JSON(http.StatusOK, gin.H{
-		"total":            len(s.sessions), // Only count data plane active sessions
-		"sessions":         s.sessions,      // Data plane active sessions
-		"stale_sessions":   s.staleSessions, // Established but no recent traffic
-		"failed_sessions":  s.failedSessions,
-		"pending_sessions": s.pendingSessions,
-		"total_all":        len(s.sessions) + len(s.staleSessions) + len(s.failedSessions) + len(s.pendingSessions),
+		"total":                 len(s.sessions), // Only count data plane active sessions
+		"sessions":              s.sessions,      // Data plane active sessions
+		"stale_sessions":        s.staleSessions, // Established but no recent traffic
+		"failed_sessions":       s.failedSessions,
+		"pending_sessions":      s.pendingSessions,
+		"unclassified_sessions": s.unclassifiedSessions,
+		"total_all": len(s.sessions) + len(s.staleSessions) + len(s.failedSessions) +
+			len(s.pendingSessions) + len(s.unclassifiedSessions),
 		"counts": gin.H{
-			"active":  len(s.sessions),
-			"stale":   len(s.staleSessions),
-			"failed":  len(s.failedSessions),
-			"pending": len(s.pendingSessions),
+			"active":       len(s.sessions),
+			"stale":        len(s.staleSessions),
+			"failed":       len(s.failedSessions),
+			"pending":      len(s.pendingSessions),
+			"unclassified": len(s.unclassifiedSessions),
 		},
 	})
 }
 
 // Session detail
 func (s *Server) handleSessionDetail(c *gin.Context) {
-	seid := c.Param("seid")
+	observationID := c.Param("observation_id")
 
 	s.statsMu.RLock()
 	defer s.statsMu.RUnlock()
 
 	for _, session := range s.sessions {
-		if session.SEID == seid {
+		if session.ObservationID == observationID {
 			c.JSON(http.StatusOK, session)
 			return
 		}
@@ -303,7 +385,7 @@ func (s *Server) proxyToAgent(c *gin.Context) {
 	if strings.HasPrefix(path, "/api/v1/") {
 		path = "/api/" + path[len("/api/v1/"):]
 	}
-	agentURL := "http://localhost:9100" + path
+	agentURL := agentBaseURL + path
 	if c.Request.URL.RawQuery != "" {
 		agentURL += "?" + c.Request.URL.RawQuery
 	}
@@ -459,6 +541,7 @@ func (s *Server) collectMetricsFromAgent() {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	var prevUplinkPackets, prevDownlinkPackets uint64
 	var prevUplinkBytes, prevDownlinkBytes uint64
 	var prevTime time.Time
 
@@ -484,20 +567,28 @@ func (s *Server) collectMetricsFromAgent() {
 			log.Printf("[WARN] Failed to fetch sessions: %v", err)
 		}
 
+		interfacesData, err := s.fetchAgentInterfaces()
+		if err != nil {
+			log.Printf("[WARN] Failed to fetch agent interface status: %v", err)
+		}
+
 		now := time.Now()
 
 		// Calculate throughput
+		var uplinkPPS, downlinkPPS float64
 		var uplinkThroughput, downlinkThroughput float64
 		if !prevTime.IsZero() {
 			elapsed := now.Sub(prevTime).Seconds()
 			if elapsed > 0 {
-				uplinkBytesDelta := metrics.uplinkBytes - prevUplinkBytes
-				downlinkBytesDelta := metrics.downlinkBytes - prevDownlinkBytes
-				uplinkThroughput = float64(uplinkBytesDelta*8) / elapsed / 1000000     // Mbps
-				downlinkThroughput = float64(downlinkBytesDelta*8) / elapsed / 1000000 // Mbps
+				uplinkPPS = counterRate(metrics.uplinkPackets, prevUplinkPackets, elapsed)
+				downlinkPPS = counterRate(metrics.downlinkPackets, prevDownlinkPackets, elapsed)
+				uplinkThroughput = counterRate(metrics.uplinkBytes, prevUplinkBytes, elapsed) * 8 / 1_000_000
+				downlinkThroughput = counterRate(metrics.downlinkBytes, prevDownlinkBytes, elapsed) * 8 / 1_000_000
 			}
 		}
 
+		prevUplinkPackets = metrics.uplinkPackets
+		prevDownlinkPackets = metrics.downlinkPackets
 		prevUplinkBytes = metrics.uplinkBytes
 		prevDownlinkBytes = metrics.downlinkBytes
 		prevTime = now
@@ -506,16 +597,18 @@ func (s *Server) collectMetricsFromAgent() {
 		s.statsMu.Lock()
 		s.stats = TrafficStats{
 			Uplink: DirectionStats{
-				Packets:     metrics.uplinkPackets,
-				Bytes:       metrics.uplinkBytes,
-				Throughput:  uplinkThroughput,
-				LastUpdated: now.Format(time.RFC3339),
+				Packets:          metrics.uplinkPackets,
+				Bytes:            metrics.uplinkBytes,
+				PacketsPerSecond: uplinkPPS,
+				Throughput:       uplinkThroughput,
+				LastUpdated:      now.Format(time.RFC3339Nano),
 			},
 			Downlink: DirectionStats{
-				Packets:     metrics.downlinkPackets,
-				Bytes:       metrics.downlinkBytes,
-				Throughput:  downlinkThroughput,
-				LastUpdated: now.Format(time.RFC3339),
+				Packets:          metrics.downlinkPackets,
+				Bytes:            metrics.downlinkBytes,
+				PacketsPerSecond: downlinkPPS,
+				Throughput:       downlinkThroughput,
+				LastUpdated:      now.Format(time.RFC3339Nano),
 			},
 		}
 
@@ -526,13 +619,27 @@ func (s *Server) collectMetricsFromAgent() {
 
 		// Update sessions from agent API (separated by status)
 		if sessionsData != nil {
+			s.updateSessionRatesLocked(sessionsData, now)
 			s.sessions = sessionsData.Sessions
 			s.staleSessions = sessionsData.StaleSessions
 			s.failedSessions = sessionsData.FailedSessions
 			s.pendingSessions = sessionsData.PendingSessions
+			s.unclassifiedSessions = sessionsData.UnclassifiedSessions
+		}
+		if interfacesData != nil {
+			s.captureStatus = *interfacesData
 		}
 		s.statsMu.Unlock()
 	}
+}
+
+// counterRate returns a per-second delta and treats a decreasing counter as a
+// reset instead of allowing uint64 underflow to create a false spike.
+func counterRate(current, previous uint64, elapsedSeconds float64) float64 {
+	if elapsedSeconds <= 0 || current < previous {
+		return 0
+	}
+	return float64(current-previous) / elapsedSeconds
 }
 
 // fetchAgentDrops fetches drop events from agent API
@@ -547,17 +654,24 @@ func (s *Server) fetchAgentDrops() (*DropStats, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&dropsData); err != nil {
 		return nil, fmt.Errorf("failed to decode drops: %w", err)
 	}
+	if dropsData.RecentDrops == nil {
+		dropsData.RecentDrops = make([]DropEvent, 0)
+	}
+	if dropsData.ByReason == nil {
+		dropsData.ByReason = make(map[string]uint64)
+	}
 
 	return &dropsData, nil
 }
 
 // SessionsResponse holds the full sessions response from agent
 type SessionsResponse struct {
-	Total           int           `json:"total"`
-	Sessions        []SessionInfo `json:"sessions"`
-	StaleSessions   []SessionInfo `json:"stale_sessions"`
-	FailedSessions  []SessionInfo `json:"failed_sessions"`
-	PendingSessions []SessionInfo `json:"pending_sessions"`
+	Total                int           `json:"total"`
+	Sessions             []SessionInfo `json:"sessions"`
+	StaleSessions        []SessionInfo `json:"stale_sessions"`
+	FailedSessions       []SessionInfo `json:"failed_sessions"`
+	PendingSessions      []SessionInfo `json:"pending_sessions"`
+	UnclassifiedSessions []SessionInfo `json:"unclassified_sessions"`
 }
 
 // fetchAgentSessions fetches sessions from agent API
@@ -573,6 +687,24 @@ func (s *Server) fetchAgentSessions() (*SessionsResponse, error) {
 		return nil, fmt.Errorf("failed to decode sessions: %w", err)
 	}
 
+	return &result, nil
+}
+
+func (s *Server) fetchAgentInterfaces() (*AgentInterfaceStatus, error) {
+	resp, err := http.Get(agentInterfacesURL)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch interface status: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("interface status returned HTTP %d", resp.StatusCode)
+	}
+
+	var result AgentInterfaceStatus
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode interface status: %w", err)
+	}
 	return &result, nil
 }
 
@@ -672,32 +804,101 @@ var _ = json.Marshal
 
 // TopologyNode represents a node in the topology
 type TopologyNode struct {
-	ID    string `json:"id"`
-	Type  string `json:"type"` // "ue", "upf", "gnb", "dn"
-	Label string `json:"label"`
-	IP    string `json:"ip"`
+	ID         string   `json:"id"`
+	Type       string   `json:"type"` // "ue", "upf", "gnb", "dn"
+	Label      string   `json:"label"`
+	IP         string   `json:"ip"`
+	N3IP       string   `json:"n3_ip,omitempty"` // UPF user-plane GTP-U endpoint
+	N4IP       string   `json:"n4_ip,omitempty"` // UPF PFCP node address
+	Roles      []string `json:"roles,omitempty"`
+	RoleSource string   `json:"role_source,omitempty"`
+	Confidence float64  `json:"confidence,omitempty"`
 }
 
 // TopologyLink represents a link in the topology
 type TopologyLink struct {
-	Source           string  `json:"source"`
-	Target           string  `json:"target"`
-	Label            string  `json:"label"`              // e.g. SEID
-	Type             string  `json:"type"`               // "n3", "n4", "n6", "n9", "radio"
-	HasActiveTraffic bool    `json:"hasActiveTraffic"`   // Whether there's active traffic
-	TrafficRate      float64 `json:"trafficRate"`        // Traffic rate in bytes/sec
-	LastSeen         string  `json:"lastSeen,omitempty"` // Timestamp of last traffic
+	Source           string   `json:"source"`
+	Target           string   `json:"target"`
+	Label            string   `json:"label"`              // e.g. SEID
+	Type             string   `json:"type"`               // "n3", "n4", "n6", "n9", "radio"
+	HasActiveTraffic bool     `json:"hasActiveTraffic"`   // Whether there's active traffic
+	TrafficRate      float64  `json:"trafficRate"`        // Traffic rate in bytes/sec
+	LastSeen         string   `json:"lastSeen,omitempty"` // Timestamp of last traffic
+	Evidence         string   `json:"evidence,omitempty"`
+	Confidence       float64  `json:"confidence,omitempty"`
+	FlowSelectors    []string `json:"flow_selectors,omitempty"`
+	Configured       bool     `json:"configured,omitempty"`
 }
 
 // Topology represents the network topology
 type Topology struct {
-	Nodes []TopologyNode `json:"nodes"`
-	Links []TopologyLink `json:"links"`
+	Nodes       []TopologyNode       `json:"nodes"`
+	Links       []TopologyLink       `json:"links"`
+	Diagnostics []TopologyDiagnostic `json:"diagnostics,omitempty"`
+}
+
+type TopologyDiagnostic struct {
+	Severity string `json:"severity"`
+	Code     string `json:"code"`
+	Message  string `json:"message"`
+	Action   string `json:"action"`
+}
+
+func topologyDiagnostics(sessionCount int, stats TrafficStats,
+	capture AgentInterfaceStatus) []TopologyDiagnostic {
+	if sessionCount > 0 {
+		return nil
+	}
+
+	trafficObserved := stats.Uplink.Packets+stats.Downlink.Packets > 0
+	requested := strings.ToLower(strings.TrimSpace(capture.RequestedConfig))
+	active := strings.ToLower(strings.TrimSpace(capture.ActiveCapture))
+	detected := strings.ToLower(strings.TrimSpace(capture.AutoDetected))
+	captureIncludesDetected := active == "any" || detected == "any" || active == detected
+	explicitMismatch := requested != "" &&
+		requested != "auto" &&
+		requested != "any" &&
+		capture.ActiveCapture != "" &&
+		capture.AutoDetected != "" &&
+		!captureIncludesDetected
+
+	if explicitMismatch {
+		return []TopologyDiagnostic{{
+			Severity: "error",
+			Code:     "pfcp_capture_interface_mismatch",
+			Message: fmt.Sprintf(
+				"PFCP capture is fixed to %q while %q was detected (%s), so sessions on the detected interface are invisible.",
+				capture.ActiveCapture, capture.AutoDetected, capture.DetectionReason),
+			Action: "Restart the agent without -pfcp-iface, then re-establish the UE PDU session.",
+		}}
+	}
+
+	if trafficObserved {
+		return []TopologyDiagnostic{{
+			Severity: "warning",
+			Code:     "gtpu_without_pfcp_session",
+			Message:  "GTP-U traffic is visible, but no PFCP session was captured, so the topology cannot be correlated safely.",
+			Action:   "Start the agent in auto mode before UE registration and re-establish the UE PDU session.",
+		}}
+	}
+	return nil
 }
 
 // isSessionActive checks if a session has recent traffic activity
 // A session is considered active if it has traffic in the last 10 seconds
 func isSessionActive(session SessionInfo) bool {
+	// Once flow-level observations exist, they are the only valid activity
+	// source. PFCP/session counters can be refreshed by control-plane activity
+	// or collide on a reused ULCL TEID and must not keep links glowing.
+	if len(session.FlowTraffic) > 0 {
+		for _, flow := range session.FlowTraffic {
+			if isFlowActive(flow) {
+				return true
+			}
+		}
+		return false
+	}
+
 	if session.LastActive == "" {
 		// No LastActive timestamp - check if there's any traffic
 		return session.PacketsUL > 0 || session.PacketsDL > 0
@@ -741,7 +942,7 @@ func getActiveFlowsByOuterDst(session SessionInfo) map[string]bool {
 	return result
 }
 
-// hasActiveFlowToN9Peer checks if session has active traffic going through N9 (to PSA-UPF)
+// hasActiveFlowToN9Peer requires flow-level evidence for N9 activity.
 func hasActiveFlowToN9Peer(session SessionInfo) bool {
 	if session.N9PeerIP == "" {
 		return false
@@ -751,16 +952,10 @@ func hasActiveFlowToN9Peer(session SessionInfo) bool {
 			return true
 		}
 	}
-	// Fallback: If no flow tracking data but this is a ULCL session,
-	// assume Internet traffic goes through N9 to PSA-UPF
-	if len(session.FlowTraffic) == 0 && session.N9PeerIP != "" {
-		return isSessionActive(session)
-	}
 	return false
 }
 
 // hasActiveFlowToLocalBreakout checks if session has active traffic NOT going through N9
-// (i.e., local breakout traffic that exits directly from I-UPF)
 func hasActiveFlowToLocalBreakout(session SessionInfo) bool {
 	for _, flow := range session.FlowTraffic {
 		if isFlowActive(flow) {
@@ -770,12 +965,8 @@ func hasActiveFlowToLocalBreakout(session SessionInfo) bool {
 			}
 		}
 	}
-	// If no flow tracking data and this is a ULCL session (has N9PeerIP),
-	// we can't determine if it's local breakout
-	// DEFAULT: Assume Internet traffic (via N9), NOT local breakout
-	// I-UPF N6 should NOT light up without explicit local breakout flow data
 	if len(session.FlowTraffic) == 0 && session.N9PeerIP != "" {
-		return false // Changed: no fallback for ULCL - assume Internet traffic
+		return false
 	}
 	// For non-ULCL sessions, fall back to session-level activity
 	if len(session.FlowTraffic) == 0 && session.N9PeerIP == "" {
@@ -784,25 +975,266 @@ func hasActiveFlowToLocalBreakout(session SessionInfo) bool {
 	return false
 }
 
-// calculateTrafficRate calculates bytes per second for a session
-func calculateTrafficRate(session SessionInfo) float64 {
-	// Simple calculation: total bytes / session duration
-	if session.CreatedAt == "" {
-		return 0
+func hasActiveFlowForRule(session SessionInfo, rule FlowRule) bool {
+	for _, flow := range session.FlowTraffic {
+		if !isFlowActive(flow) {
+			continue
+		}
+		if rule.DestinationSelector != "" &&
+			destinationMatchesSelector(flow.DestIP, rule.DestinationSelector) {
+			return true
+		}
+		if rule.DestinationSelector == "" && !rule.SDFObserved {
+			matchedSpecificRule := false
+			for _, specific := range session.FlowRules {
+				if specific.DestinationSelector != "" &&
+					destinationMatchesSelector(flow.DestIP, specific.DestinationSelector) {
+					matchedSpecificRule = true
+					break
+				}
+			}
+			if !matchedSpecificRule {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func destinationMatchesSelector(ip, selector string) bool {
+	if ip == "" || selector == "" {
+		return false
+	}
+	selectorHost := strings.Split(selector, "/")[0]
+	if parsedIP := net.ParseIP(selectorHost); parsedIP != nil && parsedIP.String() == ip {
+		return true
+	}
+	_, network, err := net.ParseCIDR(selector)
+	return err == nil && network.Contains(net.ParseIP(ip))
+}
+
+func sessionRateKey(session SessionInfo) string {
+	return session.UPFIP + "|" + session.ObservationID
+}
+
+func flowRateKey(session SessionInfo, flow FlowTraffic) string {
+	return sessionRateKey(session) + "|" + flow.Direction + "|" + flow.DestIP
+}
+
+// updateSessionRatesLocked derives current per-session PDU byte rates from
+// consecutive cumulative samples. The caller must hold statsMu.
+func (s *Server) updateSessionRatesLocked(response *SessionsResponse, now time.Time) {
+	all := make([]SessionInfo, 0,
+		len(response.Sessions)+len(response.StaleSessions)+
+			len(response.PendingSessions)+len(response.FailedSessions)+
+			len(response.UnclassifiedSessions))
+	all = append(all, response.Sessions...)
+	all = append(all, response.StaleSessions...)
+	all = append(all, response.PendingSessions...)
+	all = append(all, response.FailedSessions...)
+	all = append(all, response.UnclassifiedSessions...)
+
+	seen := make(map[string]bool, len(all))
+	seenFlows := make(map[string]bool)
+	if s.sessionSamples == nil {
+		s.sessionSamples = make(map[string]sessionCounterSample)
+	}
+	if s.sessionRates == nil {
+		s.sessionRates = make(map[string]float64)
+	}
+	if s.flowSamples == nil {
+		s.flowSamples = make(map[string]sessionCounterSample)
+	}
+	if s.flowRates == nil {
+		s.flowRates = make(map[string]float64)
+	}
+	for _, session := range all {
+		key := sessionRateKey(session)
+		seen[key] = true
+		currentBytes := session.BytesUL + session.BytesDL
+		rate := 0.0
+		if previous, ok := s.sessionSamples[key]; ok {
+			elapsed := now.Sub(previous.at).Seconds()
+			rate = counterRate(currentBytes, previous.bytes, elapsed)
+		}
+		s.sessionSamples[key] = sessionCounterSample{bytes: currentBytes, at: now}
+		s.sessionRates[key] = rate
+		for _, flow := range session.FlowTraffic {
+			flowKey := flowRateKey(session, flow)
+			seenFlows[flowKey] = true
+			flowRate := 0.0
+			if previous, ok := s.flowSamples[flowKey]; ok {
+				flowRate = counterRate(flow.Bytes, previous.bytes, now.Sub(previous.at).Seconds())
+			}
+			s.flowSamples[flowKey] = sessionCounterSample{bytes: flow.Bytes, at: now}
+			s.flowRates[flowKey] = flowRate
+		}
 	}
 
-	created, err := time.Parse(time.RFC3339, session.CreatedAt)
-	if err != nil {
-		return 0
+	for key := range s.sessionSamples {
+		if !seen[key] {
+			delete(s.sessionSamples, key)
+			delete(s.sessionRates, key)
+		}
+	}
+	for key := range s.flowSamples {
+		if !seenFlows[key] {
+			delete(s.flowSamples, key)
+			delete(s.flowRates, key)
+		}
+	}
+}
+
+// currentSessionTrafficRate returns the most recent PDU bytes/second delta.
+// statsMu must be held by the caller.
+func (s *Server) currentSessionTrafficRate(session SessionInfo) float64 {
+	if len(session.FlowTraffic) > 0 {
+		rate := 0.0
+		for _, flow := range session.FlowTraffic {
+			rate += s.flowRates[flowRateKey(session, flow)]
+		}
+		return rate
+	}
+	return s.sessionRates[sessionRateKey(session)]
+}
+
+func (s *Server) currentRuleTrafficRate(session SessionInfo, rule FlowRule) float64 {
+	rate := 0.0
+	for _, flow := range session.FlowTraffic {
+		if hasActiveFlowForRule(SessionInfo{
+			FlowRules:   session.FlowRules,
+			FlowTraffic: []FlowTraffic{flow},
+		}, rule) {
+			rate += s.flowRates[flowRateKey(session, flow)]
+		}
+	}
+	return rate
+}
+
+func resolveSessionPeers(session SessionInfo, upfIPs map[string]bool) SessionInfo {
+	// An access-side Outer Header Creation can point to either a gNB (N3) or
+	// another observed UPF (N9). Resolve it only after all PFCP-local UPFs are
+	// known; no address range or deployment-specific name is involved.
+	if session.N9PeerIP == "" && session.AccessPeerIP != "" && upfIPs[session.AccessPeerIP] {
+		session.N9PeerIP = session.AccessPeerIP
+		session.N9Direction = "towards-access"
+		session.N9Evidence = "pfcp:access-peer+observed-upf"
 	}
 
-	duration := time.Since(created).Seconds()
-	if duration <= 0 {
-		return 0
+	if session.GNBIP != "" && upfIPs[session.GNBIP] {
+		session.GNBIP = ""
 	}
+	if session.GNBIP == "" {
+		for _, candidate := range []string{session.AccessPeerIP, session.UplinkPeerIP} {
+			if candidate != "" && candidate != session.N9PeerIP && !upfIPs[candidate] {
+				session.GNBIP = candidate
+				break
+			}
+		}
+	}
+	return session
+}
 
-	totalBytes := float64(session.BytesUL + session.BytesDL)
-	return totalBytes / duration
+func canonicalUPFID(ip string, aliases map[string]string) string {
+	if canonical, found := aliases[ip]; found {
+		return canonical
+	}
+	return ip
+}
+
+func n9Endpoints(session SessionInfo, localUPF string, aliases map[string]string) (string, string, bool) {
+	if session.N9PeerIP == "" || session.N9PeerIP == localUPF {
+		return "", "", false
+	}
+	peerUPF := canonicalUPFID(session.N9PeerIP, aliases)
+	if peerUPF == localUPF {
+		return "", "", false
+	}
+	switch session.N9Direction {
+	case "towards-core":
+		return localUPF, peerUPF, true
+	case "towards-access":
+		return peerUPF, localUPF, true
+	default:
+		// A peer address without interface direction is insufficient evidence
+		// to invent an N9 path.
+		return "", "", false
+	}
+}
+
+func appendUniqueRole(roles []string, role string) []string {
+	for _, existing := range roles {
+		if existing == role {
+			return roles
+		}
+	}
+	return append(roles, role)
+}
+
+func hasRole(roles []string, role string) bool {
+	for _, existing := range roles {
+		if existing == role {
+			return true
+		}
+	}
+	return false
+}
+
+func appendUniqueString(values []string, value string) []string {
+	for _, existing := range values {
+		if existing == value {
+			return values
+		}
+	}
+	return append(values, value)
+}
+
+func flowRuleSelectorLabel(rule FlowRule) string {
+	if rule.DestinationSelector != "" {
+		return rule.DestinationSelector
+	}
+	if !rule.SDFObserved {
+		return "all traffic (no SDF filter)"
+	}
+	return ""
+}
+
+func optionalStringSlice(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return []string{value}
+}
+
+func mergeTopologyNode(nodes map[string]TopologyNode, node TopologyNode) {
+	existing, found := nodes[node.ID]
+	if !found {
+		nodes[node.ID] = node
+		return
+	}
+	if existing.IP == "" {
+		existing.IP = node.IP
+	}
+	if existing.N3IP == "" {
+		existing.N3IP = node.N3IP
+	}
+	if existing.N4IP == "" {
+		existing.N4IP = node.N4IP
+	}
+	for _, role := range node.Roles {
+		existing.Roles = appendUniqueRole(existing.Roles, role)
+	}
+	if existing.RoleSource == "" {
+		existing.RoleSource = node.RoleSource
+	}
+	if node.Confidence > existing.Confidence {
+		existing.Confidence = node.Confidence
+	}
+	nodes[node.ID] = existing
+}
+
+func normalizedDNN(dnn string) string {
+	return strings.TrimSpace(strings.Trim(dnn, "\x00"))
 }
 
 func (s *Server) handleTopology(c *gin.Context) {
@@ -821,21 +1253,37 @@ func (s *Server) handleTopology(c *gin.Context) {
 
 	// Combine all session types for topology visualization
 	// In ULCL, we need to show the network structure even if sessions are stale
-	allSessions := make([]SessionInfo, 0, len(s.sessions)+len(s.staleSessions)+len(s.pendingSessions))
+	allSessions := make([]SessionInfo, 0, len(s.sessions)+len(s.staleSessions)+
+		len(s.pendingSessions)+len(s.unclassifiedSessions))
 	allSessions = append(allSessions, s.sessions...)
 	allSessions = append(allSessions, s.staleSessions...)
 	allSessions = append(allSessions, s.pendingSessions...)
+	allSessions = append(allSessions, s.unclassifiedSessions...)
 
 	// First, identify all UPFs from N9PeerIP (these are definitely UPFs)
 	upfIPs := make(map[string]bool)
+	upfAliases := make(map[string]string)
 	for _, session := range allSessions {
 		if session.UPFIP != "" {
 			upfIPs[session.UPFIP] = true
+			upfAliases[session.UPFIP] = session.UPFIP
+			if session.UPFN3IP != "" {
+				upfIPs[session.UPFN3IP] = true
+				upfAliases[session.UPFN3IP] = session.UPFIP
+			}
 		}
 		if session.N9PeerIP != "" {
 			upfIPs[session.N9PeerIP] = true
 		}
-		// UplinkPeerIP could be gNB or I-UPF - we'll determine later
+		for _, rule := range session.FlowRules {
+			if rule.PathType == "n9" && rule.OuterDst != "" {
+				upfIPs[rule.OuterDst] = true
+			}
+		}
+		// UplinkPeerIP could be a RAN or UPF peer; resolve it after this pass.
+	}
+	for i := range allSessions {
+		allSessions[i] = resolveSessionPeers(allSessions[i], upfIPs)
 	}
 
 	// Pass 1: Create all nodes
@@ -853,31 +1301,85 @@ func (s *Server) handleTopology(c *gin.Context) {
 		// UPF Node (from session)
 		upfIP := session.UPFIP
 		if upfIP == "" {
-			upfIP = "UPF-Local"
+			// A local observation ID is not a network endpoint. Keep the UE
+			// evidence above, but do not fabricate a placeholder UPF node.
+			continue
 		}
-		// PSA-UPF is the UPF where we captured PFCP (upfIP)
-		nodes[upfIP] = TopologyNode{
-			ID:    upfIP,
-			Type:  "upf",
-			Label: "PSA-UPF",
-			IP:    upfIP,
+		upfN3IP := session.UPFN3IP
+		if existing, exists := nodes[upfIP]; exists && upfN3IP == "" {
+			upfN3IP = existing.N3IP
 		}
-
-		// N9 Peer UPF (definitely a UPF in ULCL)
-		// I-UPF is the N9 peer (intermediate UPF that receives from gNB)
-		if session.N9PeerIP != "" {
-			nodes[session.N9PeerIP] = TopologyNode{
-				ID:    session.N9PeerIP,
-				Type:  "upf",
-				Label: "I-UPF",
-				IP:    session.N9PeerIP,
+		upfDisplayIP := upfIP
+		if upfN3IP != "" {
+			upfDisplayIP = upfN3IP
+		}
+		roles := make([]string, 0, 2)
+		if session.GNBIP != "" {
+			roles = appendUniqueRole(roles, "access")
+		}
+		if session.HasN6 {
+			roles = appendUniqueRole(roles, "anchor")
+		}
+		if session.N9PeerIP != "" && session.GNBIP != "" {
+			roles = appendUniqueRole(roles, "intermediate")
+		}
+		for _, rule := range session.FlowRules {
+			switch rule.PathType {
+			case "n6":
+				roles = appendUniqueRole(roles, "anchor")
+			case "n9":
+				if session.GNBIP != "" {
+					roles = appendUniqueRole(roles, "intermediate")
+				}
 			}
 		}
+		roleSource := ""
+		confidence := 0.0
+		if len(roles) > 0 {
+			roleSource = "pfcp+ebpf-correlation"
+			confidence = 0.9
+		}
+		mergeTopologyNode(nodes, TopologyNode{
+			ID:         upfIP,
+			Type:       "upf",
+			Label:      "UPF",
+			IP:         upfDisplayIP,
+			N3IP:       upfN3IP,
+			N4IP:       session.UPFIP,
+			Roles:      roles,
+			RoleSource: roleSource,
+			Confidence: confidence,
+		})
 
-		// Determine if UplinkPeerIP is gNB or UPF
-		// If UplinkPeerIP == N9PeerIP, it's an I-UPF (already added above)
-		// If UplinkPeerIP is in upfIPs, it's a UPF
-		// Otherwise, it's likely the gNB
+		// A PFCP-classified or graph-correlated N9 peer is known to be a UPF,
+		// but no deployment-specific role name is asserted here.
+		if session.N9PeerIP != "" {
+			peerUPFID := canonicalUPFID(session.N9PeerIP, upfAliases)
+			mergeTopologyNode(nodes, TopologyNode{
+				ID:         peerUPFID,
+				Type:       "upf",
+				Label:      "UPF",
+				IP:         session.N9PeerIP,
+				RoleSource: session.N9Evidence,
+				Confidence: 0.85,
+			})
+		}
+		for _, rule := range session.FlowRules {
+			if rule.PathType != "n9" || rule.OuterDst == "" {
+				continue
+			}
+			peerUPFID := canonicalUPFID(rule.OuterDst, upfAliases)
+			mergeTopologyNode(nodes, TopologyNode{
+				ID:         peerUPFID,
+				Type:       "upf",
+				Label:      "UPF",
+				IP:         rule.OuterDst,
+				RoleSource: "pfcp:pdr-far",
+				Confidence: 1,
+			})
+		}
+
+		// Add an observed uplink peer as gNB only when it is not any known UPF.
 		uplinkPeer := session.UplinkPeerIP
 		if uplinkPeer != "" && uplinkPeer != session.N9PeerIP && !upfIPs[uplinkPeer] {
 			// This is likely the gNB
@@ -908,29 +1410,15 @@ func (s *Server) handleTopology(c *gin.Context) {
 	for _, session := range allSessions {
 		upfIP := session.UPFIP
 		if upfIP == "" {
-			upfIP = "UPF-Local"
+			continue
 		}
 
 		sessionActive := isSessionActive(session)
-		trafficRate := calculateTrafficRate(session)
+		trafficRate := s.currentSessionTrafficRate(session)
 
 		// Determine gNB (the actual radio access point)
 		gnbIP := session.GNBIP
-
-		// ULCL Path Understanding (from PFCP sniffer perspective):
-		// - We are monitoring PFCP at PSA-UPF (the anchor UPF)
-		// - upf_ip (session.UPFIP) = PSA-UPF (10.100.200.2, receives N9 from I-UPF)
-		// - n9_peer_ip = I-UPF (10.100.200.3, the N9 peer from PSA's perspective)
-		// Actual Path: gNB -> I-UPF (n9_peer_ip) -> PSA-UPF (upf_ip) -> DN
-		
-		// PSA-UPF is where we captured the PFCP
-		psaUpfIP := upfIP
-		
-		// I-UPF is the N9 peer (intermediate UPF that receives from gNB)
-		iUpfIP := ""
-		if session.N9PeerIP != "" && session.N9PeerIP != upfIP {
-			iUpfIP = session.N9PeerIP
-		}
+		n9Source, n9Target, hasN9 := n9Endpoints(session, upfIP, upfAliases)
 
 		// Link: UE -> gNB (Radio)
 		if session.UEIP != "" && gnbIP != "" {
@@ -948,9 +1436,9 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// Link: gNB -> I-UPF (N3) - gNB always connects to I-UPF
-		if gnbIP != "" && iUpfIP != "" {
-			linkKey := gnbIP + "->" + iUpfIP
+		// N3 terminates on the local UPF represented by this PFCP session.
+		if gnbIP != "" && upfIP != "" {
+			linkKey := gnbIP + "->" + upfIP
 			if existing, ok := activeLinkTraffic[linkKey]; !ok || sessionActive {
 				activeLinkTraffic[linkKey] = struct {
 					active      bool
@@ -964,17 +1452,21 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// Link: I-UPF -> PSA-UPF (N9) - only in ULCL when PSA exists
-		if psaUpfIP != "" && iUpfIP != "" && psaUpfIP != iUpfIP {
-			linkKey := iUpfIP + "->" + psaUpfIP
-			if existing, ok := activeLinkTraffic[linkKey]; !ok || sessionActive {
+		if hasN9 {
+			linkKey := n9Source + "->" + n9Target
+			n9Active := hasActiveFlowToN9Peer(session)
+			if existing, ok := activeLinkTraffic[linkKey]; !ok || n9Active {
+				n9TrafficRate := 0.0
+				if n9Active {
+					n9TrafficRate = trafficRate
+				}
 				activeLinkTraffic[linkKey] = struct {
 					active      bool
 					trafficRate float64
 					lastSeen    string
 				}{
-					active:      existing.active || sessionActive,
-					trafficRate: existing.trafficRate + trafficRate,
+					active:      existing.active || n9Active,
+					trafficRate: existing.trafficRate + n9TrafficRate,
 					lastSeen:    session.LastActive,
 				}
 			}
@@ -987,18 +1479,12 @@ func (s *Server) handleTopology(c *gin.Context) {
 	for _, session := range allSessions {
 		upfIP := session.UPFIP
 		if upfIP == "" {
-			upfIP = "UPF-Local"
+			continue
 		}
 
 		sessionActive := isSessionActive(session)
 		gnbIP := session.GNBIP
-
-		// ULCL Path (from PFCP sniffer at PSA-UPF): upfIP is PSA-UPF, n9_peer_ip is I-UPF
-		psaUpfIP := upfIP
-		iUpfIP := ""
-		if session.N9PeerIP != "" && session.N9PeerIP != upfIP {
-			iUpfIP = session.N9PeerIP
-		}
+		n9Source, n9Target, hasN9 := n9Endpoints(session, upfIP, upfAliases)
 
 		// Radio Link: UE -> gNB
 		if session.UEIP != "" && gnbIP != "" {
@@ -1018,122 +1504,240 @@ func (s *Server) handleTopology(c *gin.Context) {
 			}
 		}
 
-		// N3 Link: gNB -> I-UPF
-		if gnbIP != "" && iUpfIP != "" {
-			linkKey := gnbIP + "->" + iUpfIP
+		// N3 Link: gNB -> the local UPF observed in this PFCP session.
+		if gnbIP != "" && upfIP != "" {
+			linkKey := gnbIP + "->" + upfIP
 			if !linkSet[linkKey] {
 				linkSet[linkKey] = true
 				activity := activeLinkTraffic[linkKey]
 				links = append(links, TopologyLink{
 					Source:           gnbIP,
-					Target:           iUpfIP,
+					Target:           upfIP,
 					Label:            "N3",
 					Type:             "n3",
 					HasActiveTraffic: activity.active || sessionActive,
 					TrafficRate:      activity.trafficRate,
 					LastSeen:         activity.lastSeen,
+					Evidence:         "pfcp-access-peer+observed-upf",
+					Confidence:       0.9,
 				})
 			}
 		}
 
-		// N9 Link: I-UPF -> PSA-UPF (only in ULCL when PSA exists)
-		if psaUpfIP != "" && iUpfIP != "" && psaUpfIP != iUpfIP {
-			linkKey := iUpfIP + "->" + psaUpfIP
+		if hasN9 {
+			linkKey := n9Source + "->" + n9Target
 			if !linkSet[linkKey] {
 				linkSet[linkKey] = true
 				activity := activeLinkTraffic[linkKey]
 
-				// Use per-flow tracking to determine N9 activity
-				// Without per-flow data, use session activity as fallback for ULCL
-				n9Active := hasActiveFlowToN9Peer(session)
-				if !n9Active && sessionActive {
-					// Fallback: if session is active in ULCL, N9 is likely active
-					n9Active = true
-				}
+				// Link existence comes from PFCP semantics; active state requires
+				// flow evidence and is not inferred from generic session activity.
+				n9Active := activity.active
 
 				links = append(links, TopologyLink{
-					Source:           iUpfIP,
-					Target:           psaUpfIP,
+					Source:           n9Source,
+					Target:           n9Target,
 					Label:            "N9",
 					Type:             "n9",
 					HasActiveTraffic: n9Active,
 					TrafficRate:      activity.trafficRate,
 					LastSeen:         activity.lastSeen,
+					Evidence:         session.N9Evidence,
+					Confidence:       0.9,
 				})
 			}
 		}
 	}
 
-	// Add DN Node
-	dnID := "DN-Internet"
-	nodes[dnID] = TopologyNode{
-		ID:    dnID,
-		Type:  "dn",
-		Label: "Data Network",
-		IP:    "Internet",
+	// Add flow selectors to N9 paths. Link existence and selectors come from
+	// PFCP PDR/FAR rules; current activity remains false unless flow-level
+	// packet evidence exists.
+	n9LinkIndex := make(map[string]int)
+	for index := range links {
+		if links[index].Type == "n9" {
+			n9LinkIndex[links[index].Source+"->"+links[index].Target] = index
+		}
+	}
+	for _, session := range allSessions {
+		localUPF := session.UPFIP
+		if localUPF == "" {
+			continue
+		}
+		for _, rule := range session.FlowRules {
+			if rule.PathType != "n9" || rule.OuterDst == "" {
+				continue
+			}
+			target := canonicalUPFID(rule.OuterDst, upfAliases)
+			if target == localUPF {
+				continue
+			}
+			key := localUPF + "->" + target
+			selector := flowRuleSelectorLabel(rule)
+			if index, exists := n9LinkIndex[key]; exists {
+				if selector != "" {
+					links[index].FlowSelectors = appendUniqueString(links[index].FlowSelectors, selector)
+				}
+				links[index].Configured = true
+				links[index].HasActiveTraffic = links[index].HasActiveTraffic ||
+					hasActiveFlowForRule(session, rule)
+				links[index].TrafficRate += s.currentRuleTrafficRate(session, rule)
+				continue
+			}
+			n9LinkIndex[key] = len(links)
+			links = append(links, TopologyLink{
+				Source:           localUPF,
+				Target:           target,
+				Label:            "N9",
+				Type:             "n9",
+				HasActiveTraffic: hasActiveFlowForRule(session, rule),
+				TrafficRate:      s.currentRuleTrafficRate(session, rule),
+				LastSeen:         session.LastActive,
+				Evidence:         "pfcp:pdr-far",
+				Confidence:       1,
+				FlowSelectors:    optionalStringSlice(selector),
+				Configured:       true,
+			})
+		}
 	}
 
-	// N6 Link: UPF -> DN
-	// In ULCL architecture:
-	// - I-UPF N6 link is active only for Local Breakout traffic (not going through N9)
-	// - PSA-UPF N6 link is active only for traffic that came through N9
-
-	// Track per-UPF activity based on flow-level tracking
-	upfLocalActivity := make(map[string]bool) // For I-UPF local breakout
-	upfN9Activity := make(map[string]bool)    // For PSA-UPF (traffic via N9)
-	upfTrafficRate := make(map[string]float64)
-
+	// Build DNs from every PFCP local-breakout/default N6 rule. This is what
+	// distinguishes an ULCL-specific DN from the PSA's default DNN.
+	n6LinkIndex := make(map[string]int)
 	for _, session := range allSessions {
+		ruleBackedN6 := false
+		for _, rule := range session.FlowRules {
+			if rule.PathType != "n6" {
+				continue
+			}
+			ruleBackedN6 = true
+			upfIP := session.UPFIP
+			if upfIP == "" {
+				continue
+			}
+			selector := rule.DestinationSelector
+			dnName := ""
+			// A core-facing intermediate UPF's specific N6 rule is a local
+			// breakout DN. At a terminal/PSA UPF, multiple selectors share
+			// the same physical Network Instance/DNN and must be one DN node.
+			if session.N9Direction == "towards-core" && selector != "" {
+				dnName = selector
+			} else {
+				dnName = normalizedDNN(rule.NetworkInstance)
+				if dnName == "" {
+					dnName = normalizedDNN(session.DNN)
+				}
+			}
+			if dnName == "" {
+				// The N6 rule is real, but no DN identity was observed. A
+				// nameless DN node would assert information we do not have.
+				continue
+			}
+			dnID := "DN:" + dnName
+			nodes[dnID] = TopologyNode{
+				ID:         dnID,
+				Type:       "dn",
+				Label:      "DN: " + dnName,
+				IP:         dnName,
+				RoleSource: "pfcp:pdr-far",
+				Confidence: 1,
+			}
+			linkKey := upfIP + "->" + dnID + ":n6"
+			active := hasActiveFlowForRule(session, rule)
+			flowSelector := flowRuleSelectorLabel(rule)
+			if index, exists := n6LinkIndex[linkKey]; exists {
+				links[index].HasActiveTraffic = links[index].HasActiveTraffic || active
+				links[index].TrafficRate += s.currentRuleTrafficRate(session, rule)
+				if flowSelector != "" {
+					links[index].FlowSelectors = appendUniqueString(
+						links[index].FlowSelectors, flowSelector)
+				}
+				continue
+			}
+			n6LinkIndex[linkKey] = len(links)
+			links = append(links, TopologyLink{
+				Source:           upfIP,
+				Target:           dnID,
+				Label:            "N6",
+				Type:             "n6",
+				HasActiveTraffic: active,
+				TrafficRate:      s.currentRuleTrafficRate(session, rule),
+				LastSeen:         session.LastActive,
+				Evidence:         "pfcp:pdr-far",
+				Confidence:       1,
+				FlowSelectors:    optionalStringSlice(flowSelector),
+				Configured:       true,
+			})
+		}
+		if ruleBackedN6 {
+			continue
+		}
+
+		// A legacy/partial capture may lack the PDR/FAR graph. Only retain an
+		// N6 link when both N6 and the DNN were actually observed.
+		hasObservedN6 := session.HasN6
+		if !hasObservedN6 {
+			continue
+		}
+
 		upfIP := session.UPFIP
 		if upfIP == "" {
-			upfIP = "UPF-Local"
+			continue
+		}
+		dnn := normalizedDNN(session.DNN)
+		if dnn == "" {
+			continue
+		}
+		dnID := "DN:" + dnn
+		nodes[dnID] = TopologyNode{
+			ID:         dnID,
+			Type:       "dn",
+			Label:      "DN: " + dnn,
+			IP:         dnn,
+			RoleSource: "pfcp:network-instance",
+			Confidence: 1,
 		}
 
-		// Check for local breakout activity (I-UPF direct to DN)
-		if hasActiveFlowToLocalBreakout(session) {
-			// If this session has an I-UPF (N9PeerIP != ""), mark I-UPF as having local activity
-			if session.N9PeerIP != "" {
-				upfLocalActivity[session.N9PeerIP] = true
-			} else {
-				// No ULCL, mark main UPF as active
-				upfLocalActivity[upfIP] = true
+		linkKey := upfIP + "->" + dnID + ":n6"
+		active := isSessionActive(session)
+		rate := s.currentSessionTrafficRate(session)
+		if index, exists := n6LinkIndex[linkKey]; exists {
+			links[index].HasActiveTraffic = links[index].HasActiveTraffic || active
+			links[index].TrafficRate += rate
+			if session.LastActive != "" {
+				links[index].LastSeen = session.LastActive
 			}
+			continue
 		}
 
-		// Check for N9 activity (traffic going to PSA-UPF)
-		if hasActiveFlowToN9Peer(session) {
-			// Mark PSA-UPF as active (traffic is coming from I-UPF via N9)
-			upfN9Activity[upfIP] = true
-		}
-
-		upfTrafficRate[upfIP] += calculateTrafficRate(session)
+		n6LinkIndex[linkKey] = len(links)
+		links = append(links, TopologyLink{
+			Source:           upfIP,
+			Target:           dnID,
+			Label:            "N6",
+			Type:             "n6",
+			HasActiveTraffic: active,
+			TrafficRate:      rate,
+			LastSeen:         session.LastActive,
+			Evidence:         "pfcp:destination-interface-n6",
+			Confidence:       1,
+		})
 	}
 
-	// Add N6 link for all UPFs with flow-aware activity
-	for _, n := range nodes {
-		if n.Type == "upf" {
-			linkKey := n.ID + "->" + dnID
-			if !linkSet[linkKey] {
-				linkSet[linkKey] = true
-
-				// Determine if this UPF's N6 link has active traffic
-				// Check both local breakout activity and N9-forwarded activity
-				hasActive := upfLocalActivity[n.ID] || upfN9Activity[n.ID]
-
-				// Note: No general fallback for N6 in ULCL mode
-				// upfLocalActivity is already set for I-UPF when session is active
-				// PSA-UPF N6 only lights up when we have flow data showing N9 traffic
-
-				links = append(links, TopologyLink{
-					Source:           n.ID,
-					Target:           dnID,
-					Label:            "N6",
-					Type:             "n6",
-					HasActiveTraffic: hasActive,
-					TrafficRate:      upfTrafficRate[n.ID],
-				})
-			}
+	// Deployment-independent semantic labels derived from graph position.
+	// No container name, compose filename, or IP address participates.
+	for id, node := range nodes {
+		if node.Type != "upf" {
+			continue
 		}
+		switch {
+		case hasRole(node.Roles, "intermediate") && hasRole(node.Roles, "access"):
+			node.Label = "I-UPF"
+		case hasRole(node.Roles, "anchor") && !hasRole(node.Roles, "access"):
+			node.Label = "PSA-UPF"
+		default:
+			node.Label = "UPF"
+		}
+		nodes[id] = node
 	}
 
 	// Convert map to slice
@@ -1143,7 +1747,8 @@ func (s *Server) handleTopology(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, Topology{
-		Nodes: nodeList,
-		Links: links,
+		Nodes:       nodeList,
+		Links:       links,
+		Diagnostics: topologyDiagnostics(len(allSessions), s.stats, s.captureStatus),
 	})
 }

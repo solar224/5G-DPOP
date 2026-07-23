@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import Dashboard from './components/Dashboard'
 import { useMetrics } from './hooks/useMetrics'
+import { formatEnglishTime } from './utils/dateTime'
 
 type Theme = 'dark' | 'light'
 
@@ -82,7 +83,7 @@ function App() {
                             </span>
                         </div>
                         <div className={`text-sm ${theme === 'dark' ? 'text-slate-400' : 'text-gray-500'}`}>
-                            {new Date().toLocaleTimeString()}
+                            {formatEnglishTime(new Date())}
                         </div>
                     </div>
                 </div>

@@ -19,6 +19,24 @@ import (
 const (
 	DirectionUplink   = 0
 	DirectionDownlink = 1
+	DirectionUnknown  = 255
+)
+
+const (
+	FieldTEID    uint16 = 1 << 0
+	FieldSrcIP   uint16 = 1 << 1
+	FieldDstIP   uint16 = 1 << 2
+	FieldSrcPort uint16 = 1 << 3
+	FieldDstPort uint16 = 1 << 4
+)
+
+const (
+	OriginUnknown   = 0
+	OriginTraceDrop = 1
+	OriginEncapRecv = 2
+	OriginDevXmit   = 3
+	OriginKfreeSKB  = 4
+	OriginIPForward = 5
 )
 
 // Drop reason constants - Direct mapping from gtp5g error codes (1:1)
@@ -41,6 +59,12 @@ const (
 	DropReasonNotTPDU        = 15  // Not a T-PDU
 	DropReasonPullHdrFail    = 16  // Header pull failed
 	DropReasonNetifRxFail    = 17  // netif_rx failed
+	DropReasonUnsupportedL3  = 18  // Unsupported L3 protocol
+	DropReasonSKBPrepareFail = 19  // skb headroom preparation failed
+	DropReasonFARMissing     = 20  // PDR has no FAR
+	DropReasonInvalidFAR     = 21  // Unsupported FAR apply action
+	DropReasonOHRMissing     = 22  // Outer Header Removal missing
+	DropReasonOHCMissing     = 23  // Outer Header Creation missing
 	DropReasonUnknown        = 255 // Unknown/other reasons
 )
 
@@ -53,29 +77,35 @@ type TrafficCounter struct {
 
 // DropEvent represents a packet drop event from kernel
 type DropEvent struct {
-	Timestamp uint64
-	TEID      uint32
-	SrcIP     uint32
-	DstIP     uint32
-	SrcPort   uint16
-	DstPort   uint16
-	PktLen    uint32
-	Reason    uint8
-	Direction uint8
-	_         [2]byte // padding
+	Timestamp   uint64
+	TEID        uint32
+	SrcIP       uint32
+	DstIP       uint32
+	PktLen      uint32
+	SrcPort     uint16
+	DstPort     uint16
+	ValidFields uint16
+	Reason      uint8
+	Direction   uint8
+	Family      uint8
+	L4Protocol  uint8
+	Origin      uint8
+	ICMPType    uint8
+	_           [4]byte // padding to the 40-byte C struct
 }
 
 // PacketEvent represents a packet event for detailed tracing
 type PacketEvent struct {
-	Timestamp uint64
-	TEID      uint32
-	SrcIP     uint32
-	DstIP     uint32
-	OuterDst  uint32 // Outer destination IP (next hop UPF or gateway)
-	PktLen    uint32
-	Direction uint8
-	QFI       uint8
-	_         [2]byte // padding
+	Timestamp  uint64
+	TEID       uint32
+	SrcIP      uint32
+	DstIP      uint32
+	InnerSrcIP uint32
+	InnerDstIP uint32
+	PktLen     uint32
+	Direction  uint8
+	QFI        uint8
+	_          [2]byte // padding
 }
 
 // SessionInfo represents a PFCP session
@@ -89,11 +119,11 @@ type SessionInfo struct {
 // PDRLookupEvent represents a PDR lookup result from kernel
 // This is emitted by fentry/fexit hooks on pdr_find_by_gtp1u and pdr_find_by_ipv4
 type PDRLookupEvent struct {
-	Timestamp  uint64
-	TEID       uint32
-	PDRFound   bool // true if PDR was found
-	Direction  uint8
-	LatencyNs  uint64
+	Timestamp uint64
+	TEID      uint32
+	PDRFound  bool // true if PDR was found
+	Direction uint8
+	LatencyNs uint64
 }
 
 // Loader manages eBPF program loading and lifecycle
@@ -159,6 +189,12 @@ func (l *Loader) Load() error {
 		l.links = append(l.links, kpEncapRecv)
 		log.Println("✓ Attached kprobe to gtp5g_encap_recv (uplink traffic stats)")
 	}
+	krpEncapCleanup, err := link.Kretprobe("gtp5g_encap_recv", l.objs.KretprobeGtp5gEncapRecvCleanup, nil)
+	if err != nil {
+		log.Printf("Warning: failed to attach gtp5g_encap_recv context cleanup: %v", err)
+	} else {
+		l.links = append(l.links, krpEncapCleanup)
+	}
 
 	// Attach kprobe to gtp5g_dev_xmit
 	kpDevXmit, err := link.Kprobe("gtp5g_dev_xmit", l.objs.KprobeGtp5gDevXmit, nil)
@@ -167,6 +203,12 @@ func (l *Loader) Load() error {
 	} else {
 		l.links = append(l.links, kpDevXmit)
 		log.Println("✓ Attached kprobe to gtp5g_dev_xmit (downlink traffic stats)")
+	}
+	krpDevCleanup, err := link.Kretprobe("gtp5g_dev_xmit", l.objs.KretprobeGtp5gDevXmitCleanup, nil)
+	if err != nil {
+		log.Printf("Warning: failed to attach gtp5g_dev_xmit context cleanup: %v", err)
+	} else {
+		l.links = append(l.links, krpDevCleanup)
 	}
 
 	// =========================================================================
@@ -256,27 +298,39 @@ func (l *Loader) readDropEvents() {
 			continue
 		}
 
-		// Parse drop event
-		if len(record.RawSample) < 32 {
+		event, ok := decodeDropEvent(record.RawSample)
+		if !ok {
 			continue
-		}
-
-		event := DropEvent{
-			Timestamp: binary.LittleEndian.Uint64(record.RawSample[0:8]),
-			TEID:      binary.LittleEndian.Uint32(record.RawSample[8:12]),
-			SrcIP:     binary.LittleEndian.Uint32(record.RawSample[12:16]),
-			DstIP:     binary.LittleEndian.Uint32(record.RawSample[16:20]),
-			SrcPort:   binary.LittleEndian.Uint16(record.RawSample[20:22]),
-			DstPort:   binary.LittleEndian.Uint16(record.RawSample[22:24]),
-			PktLen:    binary.LittleEndian.Uint32(record.RawSample[24:28]),
-			Reason:    record.RawSample[28],
-			Direction: record.RawSample[29],
 		}
 
 		if l.OnDropEvent != nil {
 			l.OnDropEvent(event)
 		}
 	}
+}
+
+// decodeDropEvent must match struct drop_event in upf_monitor.bpf.c.
+func decodeDropEvent(raw []byte) (DropEvent, bool) {
+	if len(raw) < 36 {
+		return DropEvent{}, false
+	}
+
+	return DropEvent{
+		Timestamp:   binary.LittleEndian.Uint64(raw[0:8]),
+		TEID:        binary.LittleEndian.Uint32(raw[8:12]),
+		SrcIP:       binary.LittleEndian.Uint32(raw[12:16]),
+		DstIP:       binary.LittleEndian.Uint32(raw[16:20]),
+		PktLen:      binary.LittleEndian.Uint32(raw[20:24]),
+		SrcPort:     binary.LittleEndian.Uint16(raw[24:26]),
+		DstPort:     binary.LittleEndian.Uint16(raw[26:28]),
+		ValidFields: binary.LittleEndian.Uint16(raw[28:30]),
+		Reason:      raw[30],
+		Direction:   raw[31],
+		Family:      raw[32],
+		L4Protocol:  raw[33],
+		Origin:      raw[34],
+		ICMPType:    raw[35],
+	}, true
 }
 
 // GetTrafficStats retrieves current traffic statistics
@@ -496,6 +550,18 @@ func FormatDropReason(reason uint8) string {
 		return "PULL_HDR_FAIL"
 	case DropReasonNetifRxFail:
 		return "NETIF_RX_FAIL"
+	case DropReasonUnsupportedL3:
+		return "UNSUPPORTED_L3"
+	case DropReasonSKBPrepareFail:
+		return "SKB_PREPARE_FAIL"
+	case DropReasonFARMissing:
+		return "FAR_MISSING"
+	case DropReasonInvalidFAR:
+		return "INVALID_FAR_ACTION"
+	case DropReasonOHRMissing:
+		return "OHR_MISSING"
+	case DropReasonOHCMissing:
+		return "OHC_MISSING"
 	default:
 		return "UNKNOWN"
 	}
@@ -511,6 +577,57 @@ func FormatDirection(direction uint8) string {
 	default:
 		return "unknown"
 	}
+}
+
+// FormatFamily converts the parsed IP version to an API value.
+func FormatFamily(family uint8) string {
+	switch family {
+	case 4:
+		return "ipv4"
+	case 6:
+		return "ipv6"
+	default:
+		return "unknown"
+	}
+}
+
+// FormatProtocol converts an IP protocol number to a stable display value.
+func FormatProtocol(protocol uint8) string {
+	switch protocol {
+	case 6:
+		return "tcp"
+	case 17:
+		return "udp"
+	case 1:
+		return "icmp"
+	case 58:
+		return "icmpv6"
+	default:
+		return "unknown"
+	}
+}
+
+// FormatOrigin identifies the hook which supplied reliable packet context.
+func FormatOrigin(origin uint8) string {
+	switch origin {
+	case OriginTraceDrop:
+		return "gtp5g_trace_drop"
+	case OriginEncapRecv:
+		return "gtp5g_encap_recv"
+	case OriginDevXmit:
+		return "gtp5g_dev_xmit"
+	case OriginKfreeSKB:
+		return "kfree_skb"
+	case OriginIPForward:
+		return "ip_forward"
+	default:
+		return "unknown"
+	}
+}
+
+// HasField reports whether a packet field was successfully parsed.
+func (event DropEvent) HasField(field uint16) bool {
+	return event.ValidFields&field != 0
 }
 
 // FormatTimestamp converts nanosecond timestamp to time.Time
@@ -535,27 +652,35 @@ func (l *Loader) readPacketEvents() {
 			continue
 		}
 
-		// Parse packet event (now includes OuterDst field)
-		// struct size: timestamp(8) + teid(4) + src_ip(4) + dst_ip(4) + outer_dst(4) + pkt_len(4) + direction(1) + qfi(1) + pad(2) = 32 bytes
-		if len(record.RawSample) < 28 {
+		event, ok := decodePacketEvent(record.RawSample)
+		if !ok {
 			continue
-		}
-
-		event := PacketEvent{
-			Timestamp: binary.LittleEndian.Uint64(record.RawSample[0:8]),
-			TEID:      binary.LittleEndian.Uint32(record.RawSample[8:12]),
-			SrcIP:     binary.LittleEndian.Uint32(record.RawSample[12:16]),
-			DstIP:     binary.LittleEndian.Uint32(record.RawSample[16:20]),
-			OuterDst:  binary.LittleEndian.Uint32(record.RawSample[20:24]),
-			PktLen:    binary.LittleEndian.Uint32(record.RawSample[24:28]),
-			Direction: record.RawSample[28],
-			QFI:       record.RawSample[29],
 		}
 
 		if l.OnPacketEvent != nil {
 			l.OnPacketEvent(event)
 		}
 	}
+}
+
+// decodePacketEvent must match struct packet_event in upf_monitor.bpf.c.
+// The C struct has 36 meaningful bytes and is padded to 40 bytes.
+func decodePacketEvent(raw []byte) (PacketEvent, bool) {
+	if len(raw) < 36 {
+		return PacketEvent{}, false
+	}
+
+	return PacketEvent{
+		Timestamp:  binary.LittleEndian.Uint64(raw[0:8]),
+		TEID:       binary.LittleEndian.Uint32(raw[8:12]),
+		SrcIP:      binary.LittleEndian.Uint32(raw[12:16]),
+		DstIP:      binary.LittleEndian.Uint32(raw[16:20]),
+		InnerSrcIP: binary.LittleEndian.Uint32(raw[20:24]),
+		InnerDstIP: binary.LittleEndian.Uint32(raw[24:28]),
+		PktLen:     binary.LittleEndian.Uint32(raw[28:32]),
+		Direction:  raw[32],
+		QFI:        raw[33],
+	}, true
 }
 
 // readPDREvents reads PDR lookup events from the ring buffer
@@ -583,11 +708,11 @@ func (l *Loader) readPDREvents() {
 		}
 
 		event := PDRLookupEvent{
-			Timestamp:  binary.LittleEndian.Uint64(record.RawSample[0:8]),
-			TEID:       binary.LittleEndian.Uint32(record.RawSample[8:12]),
-			PDRFound:   record.RawSample[12] == 1,
-			Direction:  record.RawSample[13],
-			LatencyNs:  binary.LittleEndian.Uint64(record.RawSample[16:24]),
+			Timestamp: binary.LittleEndian.Uint64(record.RawSample[0:8]),
+			TEID:      binary.LittleEndian.Uint32(record.RawSample[8:12]),
+			PDRFound:  record.RawSample[12] == 1,
+			Direction: record.RawSample[13],
+			LatencyNs: binary.LittleEndian.Uint64(record.RawSample[16:24]),
 		}
 
 		if l.OnPDRLookupEvent != nil {

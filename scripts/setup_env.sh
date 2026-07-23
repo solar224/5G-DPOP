@@ -46,7 +46,9 @@ install_system_deps() {
         libbpf-dev \
         linux-headers-$(uname -r) \
         libelf-dev \
+        libmnl-dev \
         libpcap-dev \
+        libyaml-dev \
         pkg-config \
         bpftool \
         bpftrace \
@@ -169,17 +171,18 @@ setup_gtp5g_btf() {
     echo ""
     echo "Setting up gtp5g module with BTF support..."
     
-    # Default gtp5g source path
-    GTP5G_SRC="${GTP5G_PATH:-$HOME/gtp5g}"
+    # Default gtp5g source path for 5G-DPOP.
+    # This fork contains the gtp5g_trace_drop() hook used by the eBPF agent.
+    GTP5G_SRC="${GTP5G_PATH:-$HOME/gtp5g-DPOP}"
     
     if [ ! -d "$GTP5G_SRC" ]; then
         print_warning "gtp5g source not found at $GTP5G_SRC"
-        print_warning "Clone it with: git clone https://github.com/free5gc/gtp5g.git ~/gtp5g"
+        print_warning "Clone it with: git clone https://github.com/solar224/gtp5g-DPOP.git ~/gtp5g-DPOP"
         return 1
     fi
     
     # Check if gtp5g module is loaded and has BTF
-    if [ -f "/sys/kernel/btf/gtp5g" ]; then
+    if [ -f "/sys/kernel/btf/gtp5g" ] && [ "${FORCE_GTP5G_RELOAD:-0}" != "1" ]; then
         print_status "gtp5g module already has BTF support"
         return 0
     fi
@@ -195,7 +198,7 @@ setup_gtp5g_btf() {
     cd "$GTP5G_SRC"
     
     # Build gtp5g if needed
-    if [ ! -f "gtp5g.ko" ]; then
+    if [ ! -f "gtp5g.ko" ] || [ "${FORCE_GTP5G_RELOAD:-0}" = "1" ]; then
         print_warning "Building gtp5g module..."
         make clean
         make
@@ -205,7 +208,7 @@ setup_gtp5g_btf() {
     print_warning "Generating BTF for gtp5g.ko using pahole..."
     BTF_FILE="/tmp/gtp5g_$$.btf"
     
-    if pahole --btf_encode_detached="$BTF_FILE" --btf_base=/sys/kernel/btf/vmlinux gtp5g.ko 2>/dev/null; then
+    if pahole --btf_encode_detached="$BTF_FILE" --btf_base=/sys/kernel/btf/vmlinux gtp5g.ko 2>/dev/null && [ -s "$BTF_FILE" ]; then
         # Embed BTF into module
         if objcopy --add-section .BTF="$BTF_FILE" --set-section-flags .BTF=alloc,readonly gtp5g.ko gtp5g_btf.ko 2>/dev/null; then
             print_status "BTF generated and embedded into gtp5g_btf.ko"
@@ -213,10 +216,14 @@ setup_gtp5g_btf() {
             # Unload old module if loaded
             if lsmod | grep -q gtp5g; then
                 print_warning "Unloading existing gtp5g module..."
-                sudo rmmod gtp5g 2>/dev/null || true
+                if ! sudo rmmod gtp5g; then
+                    print_error "Cannot unload gtp5g. Stop free5GC/UPF and remove upfgtp before retrying."
+                    return 1
+                fi
             fi
             
             # Load new module with BTF
+            sudo modprobe udp_tunnel
             print_warning "Loading gtp5g_btf.ko..."
             sudo insmod gtp5g_btf.ko
             
@@ -236,6 +243,7 @@ setup_gtp5g_btf() {
     else
         print_error "Failed to generate BTF using pahole"
         print_warning "Make sure gtp5g.ko was built with debug info"
+        rm -f "$BTF_FILE"
         return 1
     fi
     
@@ -294,10 +302,9 @@ main() {
     echo ""
     echo "Next steps:"
     echo "  1. Source your bashrc: source ~/.bashrc"
-    echo "  2. Start free5gc: cd ~/free5gc-compose && docker compose -f docker-compose-ulcl.yaml up -d"
-    echo "  3. Build the project: make all"
-    echo "  4. Start observability stack: make compose-up"
-    echo "  5. Run agent: sudo ./bin/agent"
+    echo "  2. Build the project: make all"
+    echo "  3. Install frontend dependencies: make web-install"
+    echo "  4. Follow docs/quick-start.md"
     echo ""
     echo "Note: gtp5g module with BTF support has been configured."
     echo "      If you restart the system, run: scripts/setup_env.sh --gtp5g-only"
@@ -308,13 +315,17 @@ main() {
 case "${1:-}" in
     --gtp5g-only)
         echo "Setting up gtp5g BTF only..."
+        if [ "${2:-}" = "--force" ]; then
+            export FORCE_GTP5G_RELOAD=1
+        fi
         setup_gtp5g_btf
         ;;
     --help|-h)
         echo "Usage: $0 [OPTIONS]"
         echo ""
         echo "Options:"
-        echo "  --gtp5g-only    Only setup gtp5g module with BTF (use after system restart)"
+        echo "  --gtp5g-only            Only setup gtp5g module with BTF"
+        echo "  --gtp5g-only --force    Rebuild and reload gtp5g even when BTF is already present"
         echo "  --help, -h      Show this help message"
         echo ""
         echo "Without options, runs full environment setup."

@@ -1,32 +1,72 @@
-import { useState, useEffect, useRef, useMemo } from 'react'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Area, ComposedChart, ReferenceLine } from 'recharts'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+    Area,
+    CartesianGrid,
+    ComposedChart,
+    Legend,
+    Line,
+    LineChart,
+    ReferenceLine,
+    ResponsiveContainer,
+    Tooltip,
+    XAxis,
+    YAxis,
+} from 'recharts'
 import { TrafficStats } from '../services/api'
+import { formatPacketRate, selectBitRateUnit } from '../utils/units'
 
 interface TrafficChartProps {
     metrics: TrafficStats
     theme?: 'dark' | 'light'
 }
 
-interface DataPoint {
+interface RawDataPoint {
     time: string
     timestamp: number
+    uplinkBps: number
+    downlinkBps: number
+    uplinkPps: number
+    downlinkPps: number
+    uplinkPackets: number
+    downlinkPackets: number
+}
+
+interface DisplayDataPoint extends RawDataPoint {
     uplink: number
     downlink: number
-    uplinkPkts: number
-    downlinkPkts: number
 }
 
 type ChartMode = 'throughput' | 'packets' | 'combined'
 
-export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartProps) {
-    const [history, setHistory] = useState<DataPoint[]>([])
-    const lastUpdateRef = useRef<number>(0)
-    const prevPacketsRef = useRef<{ uplink: number; downlink: number }>({ uplink: 0, downlink: 0 })
-    // Auto-detect unit: if max throughput > 0.1 Mbps, use Mbps; otherwise use Kbps
-    const [useKbps, setUseKbps] = useState(true)
-    const [chartMode, setChartMode] = useState<ChartMode>('throughput')
+const HISTORY_WINDOW_MS = 60_000
 
-    // Theme-based colors
+function validTimestamp(value: string): number {
+    const parsed = Date.parse(value)
+    return Number.isFinite(parsed) ? parsed : 0
+}
+
+function niceCeiling(maxValue: number): number {
+    if (!Number.isFinite(maxValue) || maxValue <= 0) return 1
+    const magnitude = Math.pow(10, Math.floor(Math.log10(maxValue)))
+    const normalized = maxValue / magnitude
+    const multiplier = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10
+    return multiplier * magnitude
+}
+
+function average(values: number[]): number {
+    if (values.length === 0) return 0
+    return values.reduce((sum, value) => sum + value, 0) / values.length
+}
+
+function safeWindowDelta(current: number, first: number): number {
+    return current >= first ? current - first : 0
+}
+
+export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartProps) {
+    const [history, setHistory] = useState<RawDataPoint[]>([])
+    const [chartMode, setChartMode] = useState<ChartMode>('throughput')
+    const lastSampleKeyRef = useRef('')
+
     const gridColor = theme === 'dark' ? '#334155' : '#e2e8f0'
     const axisColor = theme === 'dark' ? '#64748b' : '#94a3b8'
     const tooltipBg = theme === 'dark' ? '#1e293b' : '#ffffff'
@@ -38,163 +78,116 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
     const buttonText = theme === 'dark' ? 'text-slate-400 hover:text-white' : 'text-gray-600 hover:text-gray-900'
 
     useEffect(() => {
-        const now = Date.now()
+        const sampleKey = [
+            metrics.uplink.last_updated,
+            metrics.downlink.last_updated,
+            metrics.uplink.packets,
+            metrics.downlink.packets,
+            metrics.uplink.throughput_mbps,
+            metrics.downlink.throughput_mbps,
+            metrics.uplink.packets_per_second,
+            metrics.downlink.packets_per_second,
+        ].join('|')
 
-        // Throttle updates to prevent too frequent re-renders (minimum 900ms between updates)
-        if (now - lastUpdateRef.current < 900) {
-            return
+        // REST polling and WebSocket delivery can carry the same server sample.
+        // Record it once so that one second of traffic is not double-counted.
+        if (sampleKey === lastSampleKeyRef.current) return
+        lastSampleKeyRef.current = sampleKey
+
+        const serverTimestamp = Math.max(
+            validTimestamp(metrics.uplink.last_updated),
+            validTimestamp(metrics.downlink.last_updated)
+        )
+        const timestamp = serverTimestamp || Date.now()
+        const point: RawDataPoint = {
+            timestamp,
+            time: new Date(timestamp).toLocaleTimeString('en-US', {
+                hour12: false,
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+            }),
+            // The API contract is decimal megabits per second.
+            uplinkBps: Math.max(0, metrics.uplink.throughput_mbps * 1_000_000),
+            downlinkBps: Math.max(0, metrics.downlink.throughput_mbps * 1_000_000),
+            uplinkPps: Math.max(0, metrics.uplink.packets_per_second),
+            downlinkPps: Math.max(0, metrics.downlink.packets_per_second),
+            uplinkPackets: Math.max(0, metrics.uplink.packets),
+            downlinkPackets: Math.max(0, metrics.downlink.packets),
         }
-        lastUpdateRef.current = now
 
-        const timeStr = new Date().toLocaleTimeString('en-US', {
-            hour12: false,
-            hour: '2-digit',
-            minute: '2-digit',
-            second: '2-digit'
+        setHistory(previous => {
+            const next = [...previous.filter(item => item.timestamp !== timestamp), point]
+                .sort((a, b) => a.timestamp - b.timestamp)
+            const newestTimestamp = next[next.length - 1]?.timestamp ?? timestamp
+            return next.filter(item => item.timestamp >= newestTimestamp - HISTORY_WINDOW_MS)
         })
+    }, [metrics])
 
-        // Get raw Mbps values
-        const rawUplink = metrics.uplink.throughput_mbps
-        const rawDownlink = metrics.downlink.throughput_mbps
+    const rateScale = useMemo(() => {
+        const maximum = Math.max(
+            ...history.flatMap(point => [point.uplinkBps, point.downlinkBps]),
+            0
+        )
+        return selectBitRateUnit(maximum)
+    }, [history])
 
-        // Calculate packets per second (delta)
-        const uplinkPktsDelta = metrics.uplink.packets - prevPacketsRef.current.uplink
-        const downlinkPktsDelta = metrics.downlink.packets - prevPacketsRef.current.downlink
-        prevPacketsRef.current = { uplink: metrics.uplink.packets, downlink: metrics.downlink.packets }
+    const displayData = useMemo<DisplayDataPoint[]>(() => history.map(point => ({
+        ...point,
+        uplink: point.uplinkBps / rateScale.divisor,
+        downlink: point.downlinkBps / rateScale.divisor,
+    })), [history, rateScale])
 
-        // Auto-detect if we should use Kbps or Mbps
-        // If any value exceeds 0.1 Mbps (100 Kbps), switch to Mbps
-        const maxRaw = Math.max(rawUplink, rawDownlink)
-        if (maxRaw > 0.1) {
-            setUseKbps(false)
-        } else if (maxRaw < 0.01 && history.every(h => h.uplink < 100 && h.downlink < 100)) {
-            setUseKbps(true)
-        }
-
-        setHistory(prev => {
-            // Store values in the current unit for display
-            // If useKbps, multiply by 1000 to convert Mbps to Kbps
-            const multiplier = useKbps ? 1000 : 1
-
-            // Keep more decimal precision for small values
-            const uplinkValue = rawUplink * multiplier
-            const downlinkValue = rawDownlink * multiplier
-
-            const newPoint: DataPoint = {
-                time: timeStr,
-                timestamp: now,
-                uplink: Math.round(uplinkValue * 10000) / 10000,
-                downlink: Math.round(downlinkValue * 10000) / 10000,
-                uplinkPkts: uplinkPktsDelta > 0 ? uplinkPktsDelta : 0,
-                downlinkPkts: downlinkPktsDelta > 0 ? downlinkPktsDelta : 0,
-            }
-
-            // Debug log to help troubleshoot
-            if (rawUplink > 0 || rawDownlink > 0) {
-                console.log(`TrafficChart: raw=${rawUplink.toFixed(6)}/${rawDownlink.toFixed(6)} Mbps, display=${newPoint.uplink}/${newPoint.downlink} ${useKbps ? 'Kbps' : 'Mbps'}`)
-            }
-
-            const newHistory = [...prev, newPoint]
-
-            // Keep only last 60 entries (1 minute of data at 1s interval)
-            if (newHistory.length > 60) {
-                return newHistory.slice(-60)
-            }
-            return newHistory
-        })
-    }, [metrics, useKbps])
-
-    // Calculate statistics
     const stats = useMemo(() => {
-        if (history.length === 0) return null
-
-        const uplinkValues = history.map(h => h.uplink)
-        const downlinkValues = history.map(h => h.downlink)
-        const uplinkPktsValues = history.map(h => h.uplinkPkts)
-        const downlinkPktsValues = history.map(h => h.downlinkPkts)
+        if (displayData.length === 0) return null
+        const first = displayData[0]
+        const latest = displayData[displayData.length - 1]
+        const uplinkRates = displayData.map(point => point.uplink)
+        const downlinkRates = displayData.map(point => point.downlink)
+        const uplinkPps = displayData.map(point => point.uplinkPps)
+        const downlinkPps = displayData.map(point => point.downlinkPps)
 
         return {
             uplink: {
-                avg: uplinkValues.reduce((a, b) => a + b, 0) / uplinkValues.length,
-                max: Math.max(...uplinkValues),
-                min: Math.min(...uplinkValues.filter(v => v > 0) || [0]),
-                current: uplinkValues[uplinkValues.length - 1] || 0,
+                avg: average(uplinkRates),
+                max: Math.max(...uplinkRates),
+                current: latest.uplink,
             },
             downlink: {
-                avg: downlinkValues.reduce((a, b) => a + b, 0) / downlinkValues.length,
-                max: Math.max(...downlinkValues),
-                min: Math.min(...downlinkValues.filter(v => v > 0) || [0]),
-                current: downlinkValues[downlinkValues.length - 1] || 0,
+                avg: average(downlinkRates),
+                max: Math.max(...downlinkRates),
+                current: latest.downlink,
             },
             packets: {
-                uplinkTotal: uplinkPktsValues.reduce((a, b) => a + b, 0),
-                downlinkTotal: downlinkPktsValues.reduce((a, b) => a + b, 0),
-                uplinkAvg: uplinkPktsValues.reduce((a, b) => a + b, 0) / uplinkPktsValues.length,
-                downlinkAvg: downlinkPktsValues.reduce((a, b) => a + b, 0) / downlinkPktsValues.length,
-            }
+                uplinkCurrent: latest.uplinkPps,
+                downlinkCurrent: latest.downlinkPps,
+                uplinkAvg: average(uplinkPps),
+                downlinkAvg: average(downlinkPps),
+                uplinkWindow: safeWindowDelta(latest.uplinkPackets, first.uplinkPackets),
+                downlinkWindow: safeWindowDelta(latest.downlinkPackets, first.downlinkPackets),
+            },
+            windowSeconds: Math.min(
+                60,
+                Math.max(0, Math.round((latest.timestamp - first.timestamp) / 1000))
+            ),
         }
-    }, [history])
+    }, [displayData])
 
-    // Calculate stable Y-axis domain based on data
     const yAxisDomain = useMemo(() => {
-        if (history.length === 0) return [0, 1]
+        const values = chartMode === 'packets'
+            ? displayData.flatMap(point => [point.uplinkPps, point.downlinkPps])
+            : displayData.flatMap(point => [point.uplink, point.downlink])
+        return [0, niceCeiling(Math.max(...values, 0))]
+    }, [chartMode, displayData])
 
-        const allValues = chartMode === 'packets'
-            ? history.flatMap(d => [d.uplinkPkts, d.downlinkPkts])
-            : history.flatMap(d => [d.uplink, d.downlink])
-        const maxValue = Math.max(...allValues, 0.001)
-
-        // Round up to nice intervals to prevent axis jumping
-        let ceiling: number
-        if (chartMode === 'packets') {
-            if (maxValue <= 10) ceiling = 10
-            else if (maxValue <= 50) ceiling = 50
-            else if (maxValue <= 100) ceiling = 100
-            else if (maxValue <= 500) ceiling = 500
-            else if (maxValue <= 1000) ceiling = 1000
-            else ceiling = Math.ceil(maxValue / 500) * 500
-        } else if (useKbps) {
-            // Kbps scale
-            if (maxValue <= 0.1) ceiling = 0.5
-            else if (maxValue <= 0.5) ceiling = 1
-            else if (maxValue <= 1) ceiling = 2
-            else if (maxValue <= 2) ceiling = 5
-            else if (maxValue <= 5) ceiling = 10
-            else if (maxValue <= 10) ceiling = 20
-            else if (maxValue <= 20) ceiling = 50
-            else if (maxValue <= 50) ceiling = 100
-            else if (maxValue <= 100) ceiling = 200
-            else if (maxValue <= 200) ceiling = 500
-            else if (maxValue <= 500) ceiling = 1000
-            else ceiling = Math.ceil(maxValue / 500) * 500
-        } else {
-            // Mbps scale
-            if (maxValue <= 0.1) ceiling = 0.1
-            else if (maxValue <= 0.5) ceiling = 0.5
-            else if (maxValue <= 1) ceiling = 1
-            else if (maxValue <= 2) ceiling = 2
-            else if (maxValue <= 5) ceiling = 5
-            else if (maxValue <= 10) ceiling = 10
-            else if (maxValue <= 20) ceiling = 20
-            else if (maxValue <= 50) ceiling = 50
-            else if (maxValue <= 100) ceiling = 100
-            else ceiling = Math.ceil(maxValue / 50) * 50
-        }
-
-        return [0, ceiling]
-    }, [history, useKbps, chartMode])
-
-    // Format X-axis ticks to show only every 10 seconds
     const formatXAxis = (time: string, index: number) => {
-        if (history.length <= 10) return time
-        // Show tick every 10 data points
-        if (index % 10 === 0 || index === history.length - 1) {
-            return time.slice(0, 5) // Show HH:MM only
+        if (displayData.length <= 10 || index % 10 === 0 || index === displayData.length - 1) {
+            return time
         }
         return ''
     }
 
-    if (history.length < 2) {
+    if (displayData.length < 2) {
         return (
             <div className="h-64 flex items-center justify-center text-slate-400">
                 <div className="text-center">
@@ -205,11 +198,11 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
         )
     }
 
-    const unit = chartMode === 'packets' ? 'pps' : (useKbps ? 'Kbps' : 'Mbps')
+    const unit = chartMode === 'packets' ? 'pps' : rateScale.unit
+    const windowLabel = `${stats?.windowSeconds ?? 0}s`
 
     return (
         <div className="space-y-4">
-            {/* Chart Mode Selector & Stats */}
             <div className="flex flex-wrap items-center justify-between gap-4">
                 <div className="flex items-center gap-2">
                     <span className={`text-sm ${mutedText}`}>View:</span>
@@ -223,53 +216,52 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                                     : buttonText
                                     }`}
                             >
-                                {mode === 'throughput' ? '📈 Throughput' : mode === 'packets' ? '📦 Packets' : '📊 Combined'}
+                                {mode === 'throughput' ? '📈 Throughput' : mode === 'packets' ? '📦 Packet rate' : '📊 Combined'}
                             </button>
                         ))}
                     </div>
                 </div>
 
-                {/* Quick Stats */}
                 {stats && (
                     <div className="flex gap-4 text-sm">
                         <div className="flex items-center gap-2">
-                            <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                            <span className="w-2 h-2 bg-green-500 rounded-full" />
                             <span className={mutedText}>UL:</span>
                             <span className="text-green-400 font-mono">
                                 {chartMode === 'packets'
-                                    ? `${stats.packets.uplinkAvg.toFixed(0)} pps`
-                                    : `${stats.uplink.current.toFixed(2)} ${unit}`}
+                                    ? formatPacketRate(stats.packets.uplinkCurrent)
+                                    : `${stats.uplink.current.toFixed(2)} ${rateScale.unit}`}
                             </span>
-                            <span className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>(avg: {stats.uplink.avg.toFixed(2)})</span>
+                            <span className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>
+                                (avg: {chartMode === 'packets'
+                                    ? formatPacketRate(stats.packets.uplinkAvg)
+                                    : `${stats.uplink.avg.toFixed(2)} ${rateScale.unit}`})
+                            </span>
                         </div>
                         <div className="flex items-center gap-2">
-                            <span className="w-2 h-2 bg-blue-500 rounded-full"></span>
+                            <span className="w-2 h-2 bg-blue-500 rounded-full" />
                             <span className={mutedText}>DL:</span>
                             <span className="text-blue-400 font-mono">
                                 {chartMode === 'packets'
-                                    ? `${stats.packets.downlinkAvg.toFixed(0)} pps`
-                                    : `${stats.downlink.current.toFixed(2)} ${unit}`}
+                                    ? formatPacketRate(stats.packets.downlinkCurrent)
+                                    : `${stats.downlink.current.toFixed(2)} ${rateScale.unit}`}
                             </span>
-                            <span className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>(avg: {stats.downlink.avg.toFixed(2)})</span>
+                            <span className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>
+                                (avg: {chartMode === 'packets'
+                                    ? formatPacketRate(stats.packets.downlinkAvg)
+                                    : `${stats.downlink.avg.toFixed(2)} ${rateScale.unit}`})
+                            </span>
                         </div>
                     </div>
                 )}
             </div>
 
-            {/* Chart */}
             <div className="h-56">
                 <ResponsiveContainer width="100%" height="100%">
                     {chartMode === 'combined' ? (
-                        <ComposedChart data={history} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+                        <ComposedChart data={displayData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
                             <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
-                            <XAxis
-                                dataKey="time"
-                                stroke={axisColor}
-                                fontSize={11}
-                                tickLine={false}
-                                tickFormatter={formatXAxis}
-                                interval={0}
-                            />
+                            <XAxis dataKey="time" stroke={axisColor} fontSize={11} tickLine={false} tickFormatter={formatXAxis} interval={0} />
                             <YAxis
                                 yAxisId="left"
                                 stroke={axisColor}
@@ -277,7 +269,7 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                                 tickLine={false}
                                 axisLine={false}
                                 domain={yAxisDomain}
-                                label={{ value: unit, angle: -90, position: 'insideLeft', style: { fill: axisColor, fontSize: 11 } }}
+                                label={{ value: rateScale.unit, angle: -90, position: 'insideLeft', style: { fill: axisColor, fontSize: 11 } }}
                             />
                             <YAxis
                                 yAxisId="right"
@@ -293,13 +285,13 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                                 labelStyle={{ color: textColor }}
                             />
                             <Legend />
-                            <Area yAxisId="left" type="monotone" dataKey="uplink" fill="#22c55e" fillOpacity={0.2} stroke="#22c55e" strokeWidth={2} name={`↑ UL (${unit})`} />
-                            <Area yAxisId="left" type="monotone" dataKey="downlink" fill="#3b82f6" fillOpacity={0.2} stroke="#3b82f6" strokeWidth={2} name={`↓ DL (${unit})`} />
-                            <Line yAxisId="right" type="monotone" dataKey="uplinkPkts" stroke="#86efac" strokeWidth={1} strokeDasharray="5 5" dot={false} name="↑ UL pps" />
-                            <Line yAxisId="right" type="monotone" dataKey="downlinkPkts" stroke="#93c5fd" strokeWidth={1} strokeDasharray="5 5" dot={false} name="↓ DL pps" />
+                            <Area yAxisId="left" type="monotone" dataKey="uplink" fill="#22c55e" fillOpacity={0.2} stroke="#22c55e" strokeWidth={2} name={`↑ UL (${rateScale.unit})`} />
+                            <Area yAxisId="left" type="monotone" dataKey="downlink" fill="#3b82f6" fillOpacity={0.2} stroke="#3b82f6" strokeWidth={2} name={`↓ DL (${rateScale.unit})`} />
+                            <Line yAxisId="right" type="monotone" dataKey="uplinkPps" stroke="#86efac" strokeWidth={1} strokeDasharray="5 5" dot={false} name="↑ UL pps" />
+                            <Line yAxisId="right" type="monotone" dataKey="downlinkPps" stroke="#93c5fd" strokeWidth={1} strokeDasharray="5 5" dot={false} name="↓ DL pps" />
                         </ComposedChart>
                     ) : (
-                        <LineChart data={history} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+                        <LineChart data={displayData} margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
                             <CartesianGrid strokeDasharray="3 3" stroke={gridColor} />
                             <XAxis
                                 dataKey="time"
@@ -316,14 +308,8 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                                 tickLine={false}
                                 axisLine={false}
                                 domain={yAxisDomain}
-                                tickFormatter={(value) => `${value}`}
-                                width={50}
-                                label={{
-                                    value: unit,
-                                    angle: -90,
-                                    position: 'insideLeft',
-                                    style: { fill: axisColor, fontSize: 11 }
-                                }}
+                                width={54}
+                                label={{ value: unit, angle: -90, position: 'insideLeft', style: { fill: axisColor, fontSize: 11 } }}
                             />
                             {stats && chartMode === 'throughput' && (
                                 <>
@@ -332,21 +318,17 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                                 </>
                             )}
                             <Tooltip
-                                contentStyle={{
-                                    backgroundColor: tooltipBg,
-                                    border: `1px solid ${tooltipBorder}`,
-                                    borderRadius: '8px',
-                                }}
+                                contentStyle={{ backgroundColor: tooltipBg, border: `1px solid ${tooltipBorder}`, borderRadius: '8px' }}
                                 labelStyle={{ color: textColor }}
                                 formatter={(value: number, name: string) => [
-                                    chartMode === 'packets' ? `${value} pps` : `${value.toFixed(3)} ${unit}`,
-                                    name
+                                    chartMode === 'packets' ? formatPacketRate(value) : `${value.toFixed(3)} ${rateScale.unit}`,
+                                    name,
                                 ]}
                             />
                             <Legend />
                             <Line
                                 type="monotone"
-                                dataKey={chartMode === 'packets' ? 'uplinkPkts' : 'uplink'}
+                                dataKey={chartMode === 'packets' ? 'uplinkPps' : 'uplink'}
                                 stroke="#22c55e"
                                 strokeWidth={2}
                                 dot={false}
@@ -355,7 +337,7 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                             />
                             <Line
                                 type="monotone"
-                                dataKey={chartMode === 'packets' ? 'downlinkPkts' : 'downlink'}
+                                dataKey={chartMode === 'packets' ? 'downlinkPps' : 'downlink'}
                                 stroke="#3b82f6"
                                 strokeWidth={2}
                                 dot={false}
@@ -367,24 +349,23 @@ export default function TrafficChart({ metrics, theme = 'dark' }: TrafficChartPr
                 </ResponsiveContainer>
             </div>
 
-            {/* Statistics Summary */}
             {stats && (
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
                     <div className={`${statsBg} rounded-lg p-2`}>
                         <div className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>Peak Uplink</div>
-                        <div className="text-green-400 font-mono">{stats.uplink.max.toFixed(2)} {unit}</div>
+                        <div className="text-green-400 font-mono">{stats.uplink.max.toFixed(2)} {rateScale.unit}</div>
                     </div>
                     <div className={`${statsBg} rounded-lg p-2`}>
                         <div className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>Peak Downlink</div>
-                        <div className="text-blue-400 font-mono">{stats.downlink.max.toFixed(2)} {unit}</div>
+                        <div className="text-blue-400 font-mono">{stats.downlink.max.toFixed(2)} {rateScale.unit}</div>
                     </div>
                     <div className={`${statsBg} rounded-lg p-2`}>
-                        <div className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>UL Packets (60s)</div>
-                        <div className="text-green-400/80 font-mono">{stats.packets.uplinkTotal.toLocaleString()}</div>
+                        <div className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>UL Packets (last {windowLabel})</div>
+                        <div className="text-green-400/80 font-mono">{stats.packets.uplinkWindow.toLocaleString('en-US')}</div>
                     </div>
                     <div className={`${statsBg} rounded-lg p-2`}>
-                        <div className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>DL Packets (60s)</div>
-                        <div className="text-blue-400/80 font-mono">{stats.packets.downlinkTotal.toLocaleString()}</div>
+                        <div className={`text-xs ${theme === 'dark' ? 'text-slate-500' : 'text-gray-400'}`}>DL Packets (last {windowLabel})</div>
+                        <div className="text-blue-400/80 font-mono">{stats.packets.downlinkWindow.toLocaleString('en-US')}</div>
                     </div>
                 </div>
             )}

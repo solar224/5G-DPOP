@@ -34,6 +34,12 @@ const (
 	IETypePDI                  = 2   // PDI (Packet Detection Information)
 	IETypeCreateFAR            = 3   // Create FAR
 	IETypeForwardingParameters = 4   // Forwarding Parameters
+	IETypeCreatedPDR           = 8   // Created PDR
+	IETypeUpdatePDR            = 9   // Update PDR
+	IETypeUpdateFAR            = 10  // Update FAR
+	IETypeUpdateForwarding     = 11  // Update Forwarding Parameters
+	IETypeRemovePDR            = 15  // Remove PDR
+	IETypeRemoveFAR            = 16  // Remove FAR
 	IETypeCreateURR            = 6   // Create URR
 	IETypeCreateQER            = 7   // Create QER
 	IETypeCause                = 19  // Cause
@@ -42,28 +48,85 @@ const (
 	IETypeNetworkInstance      = 22  // Network Instance (DNN)
 	IETypeSDFFilter            = 23  // SDF Filter
 	IETypeApplicationID        = 24  // Application ID
+	IETypeDestinationInterface = 42  // Destination Interface
+	IETypeApplyAction          = 44  // Apply Action
+	IETypePDRID                = 56  // PDR ID
 	IETypeFSEID                = 57  // F-SEID (Fully Qualified SEID)
+	IETypeFARID                = 108 // FAR ID
 
-	IETypeGateStatus           = 25  // Gate Status
-	IETypeMBR                  = 26  // MBR (Maximum Bit Rate)
-	IETypeGBR                  = 27  // GBR (Guaranteed Bit Rate)
-	IETypeQERCorrelationID     = 28  // QER Correlation ID
-	IETypePrecedence           = 29  // Precedence
-	IETypePDUSessionType       = 85  // PDU Session Type
-	IETypeOuterHeaderRemoval   = 95  // Outer Header Removal
-	IETypeOuterHeaderCreation  = 84  // Outer Header Creation
-	IETypeUEIPAddr             = 93  // UE IP Address
-	IETypeQFI                  = 124 // QFI (QoS Flow Identifier)
-	IEType5QI                  = 45  // 5QI (5G QoS Identifier)
-	IETypeARP                  = 46  // ARP (Allocation and Retention Priority)
-	IETypeSNSSAI               = 148 // S-NSSAI (Network Slice Selection Assistance Information)
-	IEType3GPPInterfaceType    = 160 // 3GPP Interface Type
+	IETypeGateStatus          = 25  // Gate Status
+	IETypeMBR                 = 26  // MBR (Maximum Bit Rate)
+	IETypeGBR                 = 27  // GBR (Guaranteed Bit Rate)
+	IETypeQERCorrelationID    = 28  // QER Correlation ID
+	IETypePrecedence          = 29  // Precedence
+	IETypePDNType             = 113 // PDN Type
+	IETypeOuterHeaderRemoval  = 95  // Outer Header Removal
+	IETypeOuterHeaderCreation = 84  // Outer Header Creation
+	IETypeUEIPAddr            = 93  // UE IP Address
+	IETypeQFI                 = 124 // QFI (QoS Flow Identifier)
+	IETypeSNSSAI              = 257 // S-NSSAI (Network Slice Selection Assistance Information)
+	IEType3GPPInterfaceType   = 160 // 3GPP Interface Type
 )
+
+// ForwardingRule is the FAR state needed to reconstruct a packet path. It is
+// retained separately because later PFCP Update PDR/FAR messages may carry only
+// one side of the PDR -> FAR relationship.
+type ForwardingRule struct {
+	FARID                uint32
+	ApplyAction          uint8
+	DestinationInterface int
+	InterfaceType        int
+	NetworkInstance      string
+	OuterDst             net.IP
+	OuterTEID            uint32
+}
+
+// FlowRule is one observed PFCP PDR joined to its FAR. DestinationSelector is
+// derived from a decoded SDF filter. SDFObserved distinguishes a PDR with no
+// SDF from one whose SDF was present but could not be decoded.
+type FlowRule struct {
+	PDRID                uint16
+	FARID                uint32
+	Precedence           uint32
+	SourceInterface      int
+	SourceInterfaceType  int
+	DestinationInterface int
+	InterfaceType        int
+	LocalFTEID           uint32
+	LocalFTEIDIP         net.IP
+	SDFObserved          bool
+	SDF                  string
+	DestinationSelector  string
+	PDINetworkInstance   string
+	NetworkInstance      string
+	OuterDst             net.IP
+	OuterTEID            uint32
+	PathType             string
+}
+
+type CreatedPDRFTEID struct {
+	PDRID uint16
+	TEID  uint32
+	IP    net.IP
+}
+
+// FlowTraffic is flow-level PDU observation from the eBPF GTP-U hook. Counters
+// are local to one UPF session/hop; they must not be summed across UPFs as
+// end-to-end UE volume.
+type FlowTraffic struct {
+	DestIP     net.IP
+	Packets    uint64
+	Bytes      uint64
+	LastActive time.Time
+	OuterSrc   net.IP
+	OuterDst   net.IP
+	Direction  string
+}
 
 // Establishment status constants
 const (
 	EstablishmentPending     = "Pending"     // Session Establishment Request received, waiting for completion
-	EstablishmentEstablished = "Established" // Session Modification received, session is fully established
+	EstablishmentEstablished = "Established" // Successful establishment response or later modification received
 	EstablishmentFailed      = "Failed"      // Session timed out without completion (likely N1N2 failure)
 )
 
@@ -77,21 +140,35 @@ const (
 // StaleTimeout defines how long without packets before a session is considered stale
 const StaleTimeout = 60 * time.Second
 
-// Session represents a PFCP session with its associated TEIDs
+// Session represents one observed PFCP session on one UPF.
+//
+// SEID is deliberately retained as an internal observation ID because it is
+// used throughout the in-memory indexes. It is not a PFCP SEID and must never
+// be exposed to users as one. CPSEID and UPSEID are the two endpoint-selected
+// PFCP F-SEIDs observed on N4.
 type Session struct {
-	SEID         uint64
-	LocalSEID    uint64
-	RemoteSEID   uint64
-	UEIP         net.IP
-	UPFIP        net.IP
-	GNBIP        net.IP   // Downlink Peer IP (gNB for N3)
-	UplinkPeerIP net.IP   // Uplink Peer IP (gNB or prev UPF)
-	N9PeerIP     net.IP   // N9 Peer UPF IP (for ULCL: i-upf <-> psa-upf)
-	TEIDs        []uint32 // Associated GTP TEIDs
-	CreatedAt    time.Time
-	ModifiedAt   time.Time
-	PDRCount     int
-	FARCount     int
+	SEID            uint64
+	CPSEID          uint64
+	UPSEID          uint64
+	Source          string
+	UEIP            net.IP
+	UPFIP           net.IP
+	UPFN3IP         net.IP   // Local UPF GTP-U endpoint observed on N3
+	GNBIP           net.IP   // Downlink Peer IP (gNB for N3)
+	AccessPeerIP    net.IP   // Access-side peer; resolved as gNB or UPF by topology correlation
+	UplinkPeerIP    net.IP   // Uplink Peer IP (gNB or prev UPF)
+	N9PeerIP        net.IP   // N9 Peer UPF IP (for ULCL: i-upf <-> psa-upf)
+	N9Direction     string   // "towards-core" or "towards-access"
+	N9Evidence      string   // PFCP evidence used to classify the N9 peer
+	HasN6           bool     // PFCP FAR forwards to SGi-LAN/N6-LAN
+	TEIDs           []uint32 // Associated GTP TEIDs
+	CreatedAt       time.Time
+	ModifiedAt      time.Time
+	PDRCount        int
+	FARCount        int
+	ForwardingRules []ForwardingRule
+	FlowRules       []FlowRule
+	FlowTraffic     []FlowTraffic
 
 	// Extended session info
 	SUPI        string // Subscriber Permanent ID (IMSI)
@@ -108,8 +185,6 @@ type Session struct {
 	PacketsDL uint64
 
 	// QoS parameters
-	QoS5QI      uint8  // 5G QoS Identifier
-	ARPPL       uint8  // ARP Priority Level
 	GBRUplink   uint64 // Guaranteed Bit Rate UL (kbps)
 	GBRDownlink uint64 // Guaranteed Bit Rate DL (kbps)
 	MBRUplink   uint64 // Maximum Bit Rate UL (kbps)
@@ -168,19 +243,21 @@ func (s *Session) HasValidGTPTunnel() bool {
 
 // Correlation manages the mapping between sessions and TEIDs
 type Correlation struct {
-	mu           sync.RWMutex
-	sessions     map[uint64]*Session // SEID -> Session
-	teidMap      map[uint32]uint64   // TEID -> SEID
-	ueIPMap      map[string]uint64   // UE IP string -> primary SEID (for deduplication)
-	remoteSEIDMap map[uint64]uint64  // Remote SEID (from PFCP header) -> our internal SEID
-	seidCounter  uint64              // Counter for generating unique SEIDs
+	mu          sync.RWMutex
+	sessions    map[uint64]*Session // observation ID -> Session
+	teidMap     map[uint32]uint64   // local F-TEID -> observation ID
+	ueIPMap     map[string]uint64   // UE IP + local UPF -> latest observation ID
+	cpSEIDMap   map[string]uint64   // local UPF + CP F-SEID -> observation ID
+	upSEIDMap   map[string]uint64   // local UPF + UP F-SEID -> observation ID
+	seidCounter uint64              // counter for internal observation IDs
 	// Track session creation timestamps to handle race conditions
-	sessionCreationTime map[string]time.Time // UE IP -> creation time
+	sessionCreationTime map[string]time.Time // UE IP + local UPF -> creation time
 	// Timeout checker
 	stopChan chan struct{}
 }
 
-// EstablishmentTimeout is the time to wait before marking a pending session as failed
+// EstablishmentTimeout is the time to wait for a successful establishment
+// response (or a later modification when the response was not captured).
 const EstablishmentTimeout = 10 * time.Second
 
 // NewCorrelation creates a new correlation store
@@ -189,7 +266,8 @@ func NewCorrelation() *Correlation {
 		sessions:            make(map[uint64]*Session),
 		teidMap:             make(map[uint32]uint64),
 		ueIPMap:             make(map[string]uint64),
-		remoteSEIDMap:       make(map[uint64]uint64),
+		cpSEIDMap:           make(map[string]uint64),
+		upSEIDMap:           make(map[string]uint64),
 		seidCounter:         0,
 		sessionCreationTime: make(map[string]time.Time),
 		stopChan:            make(chan struct{}),
@@ -225,7 +303,7 @@ func (c *Correlation) checkEstablishmentTimeouts() {
 	for seid, session := range c.sessions {
 		if session.EstablishmentStatus == EstablishmentPending {
 			if now.Sub(session.EstablishmentTime) > EstablishmentTimeout {
-				log.Printf("[PFCP] Session SEID=0x%x (UE IP=%s) marked as Failed - no modification received within %v",
+				log.Printf("[PFCP] Session SEID=0x%x (UE IP=%s) marked as Failed - no successful establishment response or modification received within %v",
 					seid, session.UEIP, EstablishmentTimeout)
 				session.EstablishmentStatus = EstablishmentFailed
 				session.Status = "Failed"
@@ -305,8 +383,8 @@ func (c *Correlation) UpdatePacketActivityByUEIP(ueIP string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if seid, ok := c.ueIPMap[ueIP]; ok {
-		if session, ok := c.sessions[seid]; ok {
+	for _, session := range c.sessions {
+		if session.UEIP != nil && session.UEIP.String() == ueIP {
 			session.LastPacketTime = time.Now()
 			session.DataPlaneStatus = DataPlaneActive
 			session.LastActive = session.LastPacketTime
@@ -435,180 +513,335 @@ func (c *Correlation) ValidateSessionsAgainstGtp5g(activeTEIDs map[uint32]bool) 
 	return invalidSEIDs
 }
 
-// getNextSEID generates a sequential SEID for new sessions
-// Uses atomic-like pattern with mutex already held by caller
+// getNextSEID generates an internal observation ID. The historical name is
+// retained to keep the refactor local; the value is not a PFCP SEID.
 func (c *Correlation) getNextSEID() uint64 {
 	c.seidCounter++
 	return c.seidCounter
 }
 
+func sessionLookupKey(ueIP string, upfIP net.IP) string {
+	upf := "unknown"
+	if upfIP != nil {
+		upf = upfIP.String()
+	}
+	return ueIP + "|" + upf
+}
+
+func pfcpSEIDLookupKey(upfIP net.IP, seid uint64) string {
+	upf := "unknown"
+	if upfIP != nil {
+		upf = upfIP.String()
+	}
+	return fmt.Sprintf("%s|%016x", upf, seid)
+}
+
+func (c *Correlation) registerSessionIdentitiesLocked(session *Session) {
+	if session == nil || session.SEID == 0 {
+		return
+	}
+	if session.CPSEID != 0 {
+		c.cpSEIDMap[pfcpSEIDLookupKey(session.UPFIP, session.CPSEID)] = session.SEID
+	}
+	if session.UPSEID != 0 {
+		c.upSEIDMap[pfcpSEIDLookupKey(session.UPFIP, session.UPSEID)] = session.SEID
+	}
+}
+
+func (c *Correlation) removeSessionLocked(observationID uint64) bool {
+	session, ok := c.sessions[observationID]
+	if !ok {
+		return false
+	}
+	for _, teid := range session.TEIDs {
+		if mapped, exists := c.teidMap[teid]; exists && mapped == observationID {
+			delete(c.teidMap, teid)
+		}
+	}
+	if session.UEIP != nil {
+		key := sessionLookupKey(session.UEIP.String(), session.UPFIP)
+		if mapped, exists := c.ueIPMap[key]; exists && mapped == observationID {
+			delete(c.ueIPMap, key)
+			delete(c.sessionCreationTime, key)
+		}
+	}
+	if session.CPSEID != 0 {
+		key := pfcpSEIDLookupKey(session.UPFIP, session.CPSEID)
+		if mapped, exists := c.cpSEIDMap[key]; exists && mapped == observationID {
+			delete(c.cpSEIDMap, key)
+		}
+	}
+	if session.UPSEID != 0 {
+		key := pfcpSEIDLookupKey(session.UPFIP, session.UPSEID)
+		if mapped, exists := c.upSEIDMap[key]; exists && mapped == observationID {
+			delete(c.upSEIDMap, key)
+		}
+	}
+	delete(c.sessions, observationID)
+	return true
+}
+
+func samePFCPIdentity(existing, incoming *Session) bool {
+	if existing == nil || incoming == nil {
+		return false
+	}
+	if existing.CPSEID != 0 && incoming.CPSEID != 0 {
+		return existing.CPSEID == incoming.CPSEID
+	}
+	if existing.UPSEID != 0 && incoming.UPSEID != 0 {
+		return existing.UPSEID == incoming.UPSEID
+	}
+	// An update captured without either F-SEID may still be merged by its
+	// internal ID or UE+UPF key. Two different known identities never reach
+	// this fallback.
+	return true
+}
+
+func (c *Correlation) findSameSessionLocked(session *Session) (*Session, bool) {
+	if session.SEID != 0 {
+		if existing, ok := c.sessions[session.SEID]; ok {
+			return existing, true
+		}
+	}
+	if session.CPSEID != 0 {
+		if observationID, ok := c.cpSEIDMap[pfcpSEIDLookupKey(session.UPFIP, session.CPSEID)]; ok {
+			if existing, exists := c.sessions[observationID]; exists {
+				return existing, true
+			}
+		}
+	}
+	if session.UPSEID != 0 {
+		if observationID, ok := c.upSEIDMap[pfcpSEIDLookupKey(session.UPFIP, session.UPSEID)]; ok {
+			if existing, exists := c.sessions[observationID]; exists {
+				return existing, true
+			}
+		}
+	}
+	if session.UEIP == nil {
+		return nil, false
+	}
+	if observationID, ok := c.ueIPMap[sessionLookupKey(session.UEIP.String(), session.UPFIP)]; ok {
+		if existing, exists := c.sessions[observationID]; exists && samePFCPIdentity(existing, session) {
+			return existing, true
+		}
+	}
+	return nil, false
+}
+
+func (c *Correlation) mergeSessionLocked(existing, incoming *Session) {
+	if existing.CPSEID == 0 && incoming.CPSEID != 0 {
+		existing.CPSEID = incoming.CPSEID
+	}
+	if existing.UPSEID == 0 && incoming.UPSEID != 0 {
+		existing.UPSEID = incoming.UPSEID
+	}
+	if existing.Source == "" && incoming.Source != "" {
+		existing.Source = incoming.Source
+	}
+
+	teidSet := make(map[uint32]bool, len(existing.TEIDs))
+	for _, teid := range existing.TEIDs {
+		teidSet[teid] = true
+	}
+	for _, teid := range incoming.TEIDs {
+		if teid != 0 && !teidSet[teid] {
+			existing.TEIDs = append(existing.TEIDs, teid)
+			c.teidMap[teid] = existing.SEID
+			teidSet[teid] = true
+		}
+	}
+
+	if incoming.DNN != "" {
+		existing.DNN = incoming.DNN
+	}
+	if incoming.QFI != 0 {
+		existing.QFI = incoming.QFI
+	}
+	if incoming.UPFIP != nil {
+		existing.UPFIP = cloneIP(incoming.UPFIP)
+	}
+	if incoming.UPFN3IP != nil {
+		existing.UPFN3IP = cloneIP(incoming.UPFN3IP)
+	}
+	if incoming.GNBIP != nil {
+		existing.GNBIP = cloneIP(incoming.GNBIP)
+	}
+	if incoming.AccessPeerIP != nil {
+		existing.AccessPeerIP = cloneIP(incoming.AccessPeerIP)
+	}
+	if incoming.N9PeerIP != nil {
+		existing.N9PeerIP = cloneIP(incoming.N9PeerIP)
+		existing.N9Direction = incoming.N9Direction
+		existing.N9Evidence = incoming.N9Evidence
+	}
+	existing.HasN6 = existing.HasN6 || incoming.HasN6
+	if len(incoming.ForwardingRules) > 0 {
+		existing.ForwardingRules = append([]ForwardingRule(nil), incoming.ForwardingRules...)
+	}
+	if len(incoming.FlowRules) > 0 {
+		existing.FlowRules = append([]FlowRule(nil), incoming.FlowRules...)
+	}
+	if len(incoming.FlowTraffic) > 0 {
+		existing.FlowTraffic = append([]FlowTraffic(nil), incoming.FlowTraffic...)
+	}
+	if incoming.MBRUplink > 0 {
+		existing.MBRUplink = incoming.MBRUplink
+	}
+	if incoming.MBRDownlink > 0 {
+		existing.MBRDownlink = incoming.MBRDownlink
+	}
+	if incoming.ModifiedAt.After(existing.ModifiedAt) {
+		existing.ModifiedAt = incoming.ModifiedAt
+	}
+	if incoming.EstablishmentStatus != "" {
+		existing.EstablishmentStatus = incoming.EstablishmentStatus
+	}
+	if incoming.Status != "" {
+		existing.Status = incoming.Status
+	}
+	existing.LastActive = time.Now()
+	c.registerSessionIdentitiesLocked(existing)
+}
+
 // AddSession adds or updates a session
-// Each unique UE IP should have exactly one session entry
-// This function is thread-safe and handles concurrent session creation
+// PFCP identities take precedence over UE IP so a re-established PDU session
+// cannot be silently merged with an older session that reused the same UE IP.
 func (c *Correlation) AddSession(session *Session) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If session has no UE IP, we cannot properly deduplicate - skip it
 	if session.UEIP == nil {
-		log.Printf("[WARN] AddSession: session without UE IP, skipping (SEID=0x%x)", session.SEID)
+		log.Printf("[WARN] AddSession: session without UE IP, skipping (observation=0x%x)", session.SEID)
 		return
 	}
 
-	ueIPStr := session.UEIP.String()
-
-	// Check if we already have a session for this UE IP
-	if existingSEID, exists := c.ueIPMap[ueIPStr]; exists {
-		if existingSession, ok := c.sessions[existingSEID]; ok {
-			// Only merge if this is clearly an update (same session being modified)
-			// Don't merge if the existing session was just created (within 100ms)
-			// This prevents race conditions during rapid session establishment
-			creationTime, hasTime := c.sessionCreationTime[ueIPStr]
-			timeSinceCreation := time.Since(creationTime)
-
-			if hasTime && timeSinceCreation < 100*time.Millisecond {
-				// Recent session - likely a race condition, skip this update
-				log.Printf("[DEBUG] AddSession: Skipping duplicate for UE IP %s (created %v ago)",
-					ueIPStr, timeSinceCreation)
-				return
-			}
-
-			// Merge with existing session
-			log.Printf("[DEBUG] AddSession: Merging session for UE IP %s (existing SEID=0x%x)",
-				ueIPStr, existingSEID)
-
-			// Merge TEIDs (avoid duplicates)
-			teidSet := make(map[uint32]bool)
-			for _, t := range existingSession.TEIDs {
-				teidSet[t] = true
-			}
-			for _, t := range session.TEIDs {
-				if !teidSet[t] && t != 0 {
-					existingSession.TEIDs = append(existingSession.TEIDs, t)
-					c.teidMap[t] = existingSEID
-				}
-			}
-			// Update other fields if they have better data
-			if session.DNN != "" && existingSession.DNN == "" {
-				existingSession.DNN = session.DNN
-			}
-			if session.QFI != 0 && existingSession.QFI == 0 {
-				existingSession.QFI = session.QFI
-			}
-			if session.UPFIP != nil && existingSession.UPFIP == nil {
-				existingSession.UPFIP = session.UPFIP
-			}
-			if session.GNBIP != nil && existingSession.GNBIP == nil {
-				existingSession.GNBIP = session.GNBIP
-			}
-			if session.MBRUplink > 0 {
-				existingSession.MBRUplink = session.MBRUplink
-			}
-			if session.MBRDownlink > 0 {
-				existingSession.MBRDownlink = session.MBRDownlink
-			}
-			existingSession.LastActive = time.Now()
-			return
-		}
+	if existing, ok := c.findSameSessionLocked(session); ok {
+		c.mergeSessionLocked(existing, session)
+		return
 	}
 
-	// New session with this UE IP
-	// Assign a new sequential SEID if not already set
 	if session.SEID == 0 {
 		session.SEID = c.getNextSEID()
+	} else if session.SEID > c.seidCounter {
+		c.seidCounter = session.SEID
 	}
-
-	// Register this UE IP -> SEID mapping
-	c.ueIPMap[ueIPStr] = session.SEID
-	c.sessionCreationTime[ueIPStr] = time.Now()
-
-	// Store session
+	if session.Source == "" {
+		session.Source = "pfcp"
+	}
+	ueIPStr := session.UEIP.String()
+	sessionKey := sessionLookupKey(ueIPStr, session.UPFIP)
+	c.ueIPMap[sessionKey] = session.SEID
+	c.sessionCreationTime[sessionKey] = time.Now()
 	c.sessions[session.SEID] = session
+	c.registerSessionIdentitiesLocked(session)
 	for _, teid := range session.TEIDs {
 		if teid != 0 {
 			c.teidMap[teid] = session.SEID
 		}
 	}
 
-	log.Printf("[DEBUG] AddSession: New session SEID=0x%x for UE IP %s (total sessions: %d)",
+	log.Printf("[DEBUG] AddSession: New observation=0x%x for UE IP %s (total sessions: %d)",
 		session.SEID, ueIPStr, len(c.sessions))
 }
 
 // RemoveSession removes a session
-func (c *Correlation) RemoveSession(seid uint64) {
+func (c *Correlation) RemoveSession(observationID uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if session, ok := c.sessions[seid]; ok {
-		for _, teid := range session.TEIDs {
-			delete(c.teidMap, teid)
-		}
-		// Remove from UE IP map and creation time tracking
-		if session.UEIP != nil {
-			ueIPStr := session.UEIP.String()
-			delete(c.ueIPMap, ueIPStr)
-			delete(c.sessionCreationTime, ueIPStr)
-		}
-		// Remove from remote SEID map
-		if session.RemoteSEID != 0 {
-			delete(c.remoteSEIDMap, session.RemoteSEID)
-		}
-		delete(c.sessions, seid)
-		log.Printf("[DEBUG] RemoveSession: Removed SEID=0x%x (total sessions: %d)", seid, len(c.sessions))
+	if c.removeSessionLocked(observationID) {
+		log.Printf("[DEBUG] RemoveSession: Removed observation=0x%x (total sessions: %d)",
+			observationID, len(c.sessions))
 	}
 }
 
-// RegisterRemoteSEID registers a remote SEID (from PFCP header) to our internal SEID
-// This enables proper session lookup during Session Deletion per 3GPP TS 29.244
-func (c *Correlation) RegisterRemoteSEID(remoteSEID uint64, internalSEID uint64) {
+// RegisterUPSEID records a UPF-selected F-SEID observed in a request header or
+// Session Establishment Response.
+func (c *Correlation) RegisterUPSEID(upfIP net.IP, upSEID, observationID uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	
-	if remoteSEID != 0 && internalSEID != 0 {
-		c.remoteSEIDMap[remoteSEID] = internalSEID
-		// Also update the session's RemoteSEID field
-		if session, ok := c.sessions[internalSEID]; ok {
-			session.RemoteSEID = remoteSEID
-			log.Printf("[DEBUG] RegisterRemoteSEID: Mapped remote SEID 0x%x -> internal SEID 0x%x", remoteSEID, internalSEID)
-		}
+
+	session, ok := c.sessions[observationID]
+	if !ok || upSEID == 0 {
+		return false
 	}
+	if session.UPSEID != 0 && session.UPSEID != upSEID {
+		log.Printf("[PFCP-WARN] Refusing conflicting UP F-SEID for observation 0x%x: have=0x%x new=0x%x",
+			observationID, session.UPSEID, upSEID)
+		return false
+	}
+	if upfIP != nil && session.UPFIP != nil && !session.UPFIP.Equal(upfIP) {
+		return false
+	}
+	session.UPSEID = upSEID
+	c.upSEIDMap[pfcpSEIDLookupKey(session.UPFIP, upSEID)] = observationID
+	return true
 }
 
-// GetSessionByRemoteSEID looks up session by remote SEID (from PFCP header)
-func (c *Correlation) GetSessionByRemoteSEID(remoteSEID uint64) (*Session, bool) {
+// ConfirmSessionEstablishment correlates a response by the CP F-SEID carried in
+// its PFCP header. It intentionally has no "newest pending session" fallback:
+// such a fallback can cross-wire concurrent establishments on the same UPF.
+func (c *Correlation) ConfirmSessionEstablishment(
+	upfIP net.IP,
+	cpSEID, upSEID uint64,
+) (*Session, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if cpSEID == 0 {
+		return nil, false
+	}
+	observationID, ok := c.cpSEIDMap[pfcpSEIDLookupKey(upfIP, cpSEID)]
+	if !ok {
+		return nil, false
+	}
+	session, ok := c.sessions[observationID]
+	if !ok {
+		return nil, false
+	}
+	if upSEID != 0 {
+		if session.UPSEID != 0 && session.UPSEID != upSEID {
+			return nil, false
+		}
+		session.UPSEID = upSEID
+		c.upSEIDMap[pfcpSEIDLookupKey(upfIP, upSEID)] = observationID
+	}
+	now := time.Now()
+	session.EstablishmentStatus = EstablishmentEstablished
+	session.Status = "Active"
+	session.ModifiedAt = now
+	session.LastActive = now
+	return session, true
+}
+
+// GetSessionByUPSEID looks up the PFCP session addressed by a CP-to-UPF
+// session-level request.
+func (c *Correlation) GetSessionByUPSEID(upfIP net.IP, upSEID uint64) (*Session, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	if internalSEID, ok := c.remoteSEIDMap[remoteSEID]; ok {
-		if session, ok := c.sessions[internalSEID]; ok {
+	if observationID, ok := c.upSEIDMap[pfcpSEIDLookupKey(upfIP, upSEID)]; ok {
+		if session, ok := c.sessions[observationID]; ok {
 			return session, true
 		}
 	}
 	return nil, false
 }
 
-// RemoveSessionByRemoteSEID removes a session by remote SEID
-func (c *Correlation) RemoveSessionByRemoteSEID(remoteSEID uint64) bool {
+// RemoveSessionByUPSEID removes the session addressed by the UPF-selected
+// F-SEID in a Session Deletion Request.
+func (c *Correlation) RemoveSessionByUPSEID(upfIP net.IP, upSEID uint64) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if internalSEID, ok := c.remoteSEIDMap[remoteSEID]; ok {
-		if session, ok := c.sessions[internalSEID]; ok {
-			// Clean up all mappings
-			for _, teid := range session.TEIDs {
-				delete(c.teidMap, teid)
-			}
-			if session.UEIP != nil {
-				ueIPStr := session.UEIP.String()
-				delete(c.ueIPMap, ueIPStr)
-				delete(c.sessionCreationTime, ueIPStr)
-			}
-			delete(c.remoteSEIDMap, remoteSEID)
-			delete(c.sessions, internalSEID)
-			log.Printf("[DEBUG] RemoveSessionByRemoteSEID: Removed remote SEID 0x%x (internal 0x%x, total: %d)", 
-				remoteSEID, internalSEID, len(c.sessions))
-			return true
-		}
+	observationID, ok := c.upSEIDMap[pfcpSEIDLookupKey(upfIP, upSEID)]
+	if !ok {
+		return false
+	}
+	if c.removeSessionLocked(observationID) {
+		log.Printf("[DEBUG] RemoveSessionByUPSEID: Removed UP F-SEID 0x%x (observation 0x%x, total: %d)",
+			upSEID, observationID, len(c.sessions))
+		return true
 	}
 	return false
 }
@@ -622,6 +855,50 @@ func (c *Correlation) GetSessionByTEID(teid uint32) (*Session, bool) {
 		return c.sessions[seid], true
 	}
 	return nil, false
+}
+
+// ApplyCreatedPDRFTEIDs records UPF-allocated Local F-TEIDs returned in
+// Created PDR IEs. These values were not available in the establishment
+// request when the CH (choose) flag was used.
+func (c *Correlation) ApplyCreatedPDRFTEIDs(
+	observationID uint64,
+	endpoints []CreatedPDRFTEID,
+) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	session, ok := c.sessions[observationID]
+	if !ok {
+		return
+	}
+	for _, endpoint := range endpoints {
+		for index := range session.FlowRules {
+			if session.FlowRules[index].PDRID != endpoint.PDRID {
+				continue
+			}
+			if endpoint.TEID != 0 {
+				session.FlowRules[index].LocalFTEID = endpoint.TEID
+			}
+			if endpoint.IP != nil {
+				session.FlowRules[index].LocalFTEIDIP = cloneIP(endpoint.IP)
+			}
+			break
+		}
+		if endpoint.TEID == 0 {
+			continue
+		}
+		found := false
+		for _, teid := range session.TEIDs {
+			if teid == endpoint.TEID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			session.TEIDs = append(session.TEIDs, endpoint.TEID)
+		}
+		c.teidMap[endpoint.TEID] = observationID
+	}
 }
 
 // GetSessionBySEID looks up session by SEID
@@ -644,6 +921,19 @@ func (c *Correlation) GetSessionByUEIP(ueIP string) (*Session, bool) {
 		}
 	}
 	return nil, false
+}
+
+// GetSessionByUEIPAndUPF returns the PFCP session local to a specific UPF.
+func (c *Correlation) GetSessionByUEIPAndUPF(ueIP string, upfIP net.IP) (*Session, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	seid, ok := c.ueIPMap[sessionLookupKey(ueIP, upfIP)]
+	if !ok {
+		return nil, false
+	}
+	session, ok := c.sessions[seid]
+	return session, ok
 }
 
 // GetAllSessions returns all sessions
@@ -754,8 +1044,10 @@ func NewSniffer(iface string, port uint16, correlation *Correlation) *Sniffer {
 	}
 }
 
-// AutoDetectInterface automatically detects the best interface for PFCP capture
-// It checks for common patterns used by free5gc and other 5G deployments
+// AutoDetectInterface automatically detects the safest interface for PFCP capture.
+// A specifically named free5GC bridge is preferred. Otherwise "any" is used
+// because native free5GC commonly carries PFCP over loopback, while an unrelated
+// Docker bridge may belong only to the observability stack.
 // Returns the interface name and a description of how it was detected
 func AutoDetectInterface() (string, string) {
 	// Get all available interfaces
@@ -773,60 +1065,11 @@ func AutoDetectInterface() (string, string) {
 		if name == "br-free5gc" ||
 			strings.HasPrefix(name, "br-free5gc") ||
 			strings.Contains(name, "free5gc") {
-			log.Printf("[AUTO-DETECT] Found free5gc bridge interface: %s", name)
 			return name, "free5gc Docker bridge"
 		}
 	}
 
-	// Priority 2: Look for Docker bridge interfaces (br-*) with IP in common 5G network ranges
-	// free5gc typically uses 10.100.200.0/24, but other setups may vary
-	commonRanges := []string{"10.100.", "10.200.", "10.60.", "10.61.", "192.168.100.", "172."}
-	for _, dev := range devices {
-		if !strings.HasPrefix(dev.Name, "br-") {
-			continue
-		}
-		for _, addr := range dev.Addresses {
-			ip := addr.IP.String()
-			for _, prefix := range commonRanges {
-				if strings.HasPrefix(ip, prefix) {
-					log.Printf("[AUTO-DETECT] Found Docker bridge with 5G network IP: %s (%s)", dev.Name, ip)
-					return dev.Name, fmt.Sprintf("Docker bridge with IP %s", ip)
-				}
-			}
-		}
-	}
-
-	// Priority 3: Look for any Docker bridge interface (br-*)
-	for _, dev := range devices {
-		if strings.HasPrefix(dev.Name, "br-") && dev.Name != "br-lan" {
-			log.Printf("[AUTO-DETECT] Found Docker bridge interface: %s", dev.Name)
-			return dev.Name, "Docker bridge (generic)"
-		}
-	}
-
-	// Priority 4: Look for interfaces with IP in 5G network ranges (non-bridge)
-	// This handles cases where free5gc runs on host networking
-	for _, dev := range devices {
-		// Skip loopback and common non-relevant interfaces
-		if dev.Name == "lo" || strings.HasPrefix(dev.Name, "veth") ||
-			strings.HasPrefix(dev.Name, "docker") || dev.Name == "virbr0" {
-			continue
-		}
-		for _, addr := range dev.Addresses {
-			ip := addr.IP.String()
-			for _, prefix := range commonRanges {
-				if strings.HasPrefix(ip, prefix) {
-					log.Printf("[AUTO-DETECT] Found interface with 5G network IP: %s (%s)", dev.Name, ip)
-					return dev.Name, fmt.Sprintf("interface with IP %s", ip)
-				}
-			}
-		}
-	}
-
-	// Priority 5: Use "any" to capture from all interfaces
-	// This is the safest fallback but may capture irrelevant traffic
-	log.Printf("[AUTO-DETECT] No specific interface found, using 'any' to capture from all interfaces")
-	return "any", "all interfaces (no specific match found)"
+	return "any", "all interfaces (includes native free5GC loopback PFCP)"
 }
 
 // DetectAndListInterfaces lists all available interfaces with their details
@@ -908,6 +1151,12 @@ func (s *Sniffer) Stop() {
 	}
 }
 
+// Interface returns the interface that is actually used for packet capture.
+// This may differ from the requested interface when Start falls back to "any".
+func (s *Sniffer) Interface() string {
+	return s.iface
+}
+
 func (s *Sniffer) captureLoop() {
 	packetSource := gopacket.NewPacketSource(s.handle, s.handle.LinkType())
 
@@ -977,9 +1226,10 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 		ieDataEnd = len(payload)
 	}
 
-	// Ensure we have IE data to process
-	if ieOffset >= ieDataEnd {
-		log.Printf("[PFCP-WARN] No IE data in message (offset=%d, end=%d)", ieOffset, ieDataEnd)
+	// Empty IE data is valid for messages such as Session Deletion Request.
+	// Reject only malformed packets where the header extends past the message.
+	if ieOffset > ieDataEnd {
+		log.Printf("[PFCP-WARN] Invalid IE offset (offset=%d, end=%d)", ieOffset, ieDataEnd)
 		return
 	}
 
@@ -997,7 +1247,7 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 		log.Printf("[PFCP-DEBUG] Session Establishment Response: SEID=0x%x (SMF's SEID)", seid)
 		// Extract UPF's F-SEID from response to map UPF-SEID -> Internal-SEID
 		// This is CRITICAL for Session Deletion, as SMF uses UPF's SEID in Deletion Request
-		s.handleSessionEstablishmentResponse(seid, ieData)
+		s.handleSessionEstablishmentResponse(seid, ieData, srcIP)
 	case MsgTypeSessionModificationRequest:
 		log.Printf("[PFCP-DEBUG] Session Modification Request: SEID=0x%x, UPF=%s", seid, dstIP)
 		s.handleSessionModification(seid, ieData, dstIP)
@@ -1005,7 +1255,7 @@ func (s *Sniffer) processPacket(packet gopacket.Packet) {
 		log.Printf("[PFCP-DEBUG] Session Modification Response: SEID=0x%x (ignored)", seid)
 	case MsgTypeSessionDeletionRequest:
 		log.Printf("[PFCP-DEBUG] Session Deletion Request: SEID=0x%x", seid)
-		s.handleSessionDeletion(seid)
+		s.handleSessionDeletion(seid, dstIP)
 	case MsgTypeSessionDeletionResponse:
 		log.Printf("[PFCP-DEBUG] Session Deletion Response: SEID=0x%x (ignored)", seid)
 	case MsgTypeSessionReportRequest:
@@ -1045,6 +1295,8 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte, upfIP net.IP)
 	now := time.Now()
 	session := &Session{
 		SEID:                0, // Will be assigned by AddSession
+		CPSEID:              extractTopLevelFSEID(ieData),
+		Source:              "pfcp",
 		UEIP:                ueIP,
 		UPFIP:               upfIP, // Set UPF IP from PFCP message destination
 		CreatedAt:           now,
@@ -1060,6 +1312,7 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte, upfIP net.IP)
 
 	// Extract F-TEID details (gNB/peer UPF IPs from Outer Header Creation)
 	s.extractFTEIDDetails(ieData, session)
+	s.extractFlowRules(ieData, session)
 
 	// Add session (will handle deduplication and SEID assignment)
 	s.correlation.AddSession(session)
@@ -1071,23 +1324,33 @@ func (s *Sniffer) handleSessionEstablishmentRequest(ieData []byte, upfIP net.IP)
 func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP net.IP) {
 	log.Printf("[PFCP] Session Modification: SEID=0x%x, UPF=%s", seid, upfIP)
 
-	// First try to find session by UE IP (our primary key)
+	// The request header is the UPF-selected F-SEID and is the authoritative
+	// lookup key for CP-to-UPF session messages.
 	ueIP := s.extractUEIP(ieData)
 	var session *Session
 	var ok bool
 
-	if ueIP != nil {
-		session, ok = s.correlation.GetSessionByUEIP(ueIP.String())
-		if ok {
-			log.Printf("   └─ Found session by UE IP %s (SEID=0x%x)", ueIP.String(), session.SEID)
-		}
+	if seid != 0 {
+		session, ok = s.correlation.GetSessionByUPSEID(upfIP, seid)
 	}
 
-	// If not found by UE IP, try by SEID (fallback)
-	if !ok {
-		session, ok = s.correlation.GetSessionBySEID(seid)
+	// If the establishment response was missed, the UE+UPF evidence in this
+	// modification can recover the mapping without guessing another session.
+	if !ok && ueIP != nil {
+		session, ok = s.correlation.GetSessionByUEIPAndUPF(ueIP.String(), upfIP)
 		if ok {
-			log.Printf("   └─ Found session by SEID 0x%x", seid)
+			if session.UPSEID != 0 && session.UPSEID != seid {
+				log.Printf("[PFCP-WARN] UE %s on UPF %s is already bound to UP F-SEID 0x%x; refusing header 0x%x",
+					ueIP, upfIP, session.UPSEID, seid)
+				session = nil
+				ok = false
+			} else if seid != 0 {
+				ok = s.correlation.RegisterUPSEID(upfIP, seid, session.SEID)
+			}
+		}
+		if ok {
+			log.Printf("   └─ Recovered session by UE IP %s and UPF %s (observation=0x%x)",
+				ueIP.String(), upfIP, session.SEID)
 		}
 	}
 
@@ -1105,6 +1368,8 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP ne
 		now := time.Now()
 		session = &Session{
 			SEID:                0, // Will be assigned by AddSession
+			UPSEID:              seid,
+			Source:              "pfcp",
 			UEIP:                ueIP,
 			UPFIP:               upfIP, // Set UPF IP from PFCP message destination
 			CreatedAt:           now,
@@ -1127,6 +1392,14 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP ne
 	if session.UPFIP == nil && upfIP != nil {
 		session.UPFIP = upfIP
 	}
+	if cpSEID := extractTopLevelFSEID(ieData); cpSEID != 0 {
+		if session.CPSEID == 0 || session.CPSEID == cpSEID {
+			session.CPSEID = cpSEID
+		} else {
+			log.Printf("[PFCP-WARN] Observation 0x%x received conflicting CP F-SEID: have=0x%x new=0x%x",
+				session.SEID, session.CPSEID, cpSEID)
+		}
+	}
 
 	// Extract session info from modification IEs
 	s.extractSessionInfo(ieData, session)
@@ -1139,60 +1412,51 @@ func (s *Sniffer) handleSessionModification(seid uint64, ieData []byte, upfIP ne
 		session.UEIP = ueIP
 	}
 
-	// Extract gNB IP from Modification (this is where gNB endpoint info appears)
-	s.extractGNBIPFromModification(ieData, session)
+	// Refresh interface semantics from updated FARs. Access-side peers remain
+	// unclassified until correlated with the set of observed UPFs.
+	s.extractFTEIDDetails(ieData, session)
+	s.extractFlowRules(ieData, session)
 
 	session.ModifiedAt = time.Now()
 	session.LastActive = time.Now()
 	s.correlation.AddSession(session)
 
-	// Register the PFCP header SEID as a remote SEID for this session
-	// This enables proper session lookup during Session Deletion per 3GPP TS 29.244
-	if seid != 0 && session.SEID != 0 {
-		s.correlation.RegisterRemoteSEID(seid, session.SEID)
-	}
-
 	log.Printf("   └─ Updated: TEIDs: %v, UE_IP: %v, UPF_IP: %v, MBR: UL=%d/DL=%d kbps, Status: %s",
 		session.TEIDs, session.UEIP, session.UPFIP, session.MBRUplink, session.MBRDownlink, session.EstablishmentStatus)
 }
 
-func (s *Sniffer) handleSessionDeletion(seid uint64) {
-	log.Printf("PFCP Session Deletion Request: SEID=0x%x", seid)
-	
-	// Per 3GPP TS 29.244, the SEID in Session Deletion Request is the remote (CP) SEID
-	// We need to look up by remote SEID first, then fall back to internal SEID
-	
-	// Try 1: Look up by remote SEID (most likely match per 3GPP spec)
-	if s.correlation.RemoveSessionByRemoteSEID(seid) {
-		log.Printf("   └─ Removed session by remote SEID 0x%x (3GPP compliant)", seid)
+func (s *Sniffer) handleSessionDeletion(upSEID uint64, upfIP net.IP) {
+	log.Printf("PFCP Session Deletion Request: UP_F-SEID=0x%x UPF=%s", upSEID, upfIP)
+
+	if s.correlation.RemoveSessionByUPSEID(upfIP, upSEID) {
+		log.Printf("   └─ Removed session by UP F-SEID 0x%x", upSEID)
 		return
 	}
-	
-	// Try 2: Look up by internal SEID (fallback for edge cases)
-	if session, ok := s.correlation.GetSessionBySEID(seid); ok {
-		s.correlation.RemoveSession(seid)
-		log.Printf("   └─ Removed session by internal SEID 0x%x (UE: %s)", seid, session.UEIP)
-		return
-	}
-	
-	// Session not found - this may happen if we missed the establishment or it was already deleted
-	log.Printf("   └─ Session SEID 0x%x not found (may be stale or already deleted)", seid)
+	log.Printf("   └─ UP F-SEID 0x%x on UPF %s was not correlated; no session removed", upSEID, upfIP)
 }
 
 // handleSessionEstablishmentResponse processes Session Establishment Response to capture UPF's F-SEID
 // The header SEID in Response is the SMF's SEID.
 // The UPF's assigned SEID is in the F-SEID IE. We need to map UPF-SEID -> Internal-Session.
-func (s *Sniffer) handleSessionEstablishmentResponse(smfSEID uint64, ieData []byte) {
+func (s *Sniffer) handleSessionEstablishmentResponse(smfSEID uint64, ieData []byte, upfIP net.IP) {
 	// In Establishment Response (UPF->SMF):
-	// - Header SEID = SMF's SEID (current implementation ignores this mapping)
-	// - F-SEID IE = UPF's SEID (this is what SMF will use for Deletion Request)
+	// - Header SEID = CP F-SEID selected by the SMF.
+	// - F-SEID IE = UP F-SEID selected by this UPF.
 
 	var upfSEID uint64
-	
+	var cause uint8
+	var causeSeen bool
+
 	log.Printf("[PFCP-DEBUG] Parsing Establishment Response IEs (len=%d)", len(ieData))
 	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
 		log.Printf("[PFCP-DEBUG] IE Type: %d (len=%d)", ieType, len(ieValue))
-		if ieType == IETypeFSEID {
+		switch ieType {
+		case IETypeCause:
+			if len(ieValue) > 0 {
+				cause = ieValue[0]
+				causeSeen = true
+			}
+		case IETypeFSEID:
 			// Parse F-SEID (UPF's SEID)
 			// Flags (1) + SEID (8) + ...
 			log.Printf("[PFCP-DEBUG] Found F-SEID IE: %x", ieValue)
@@ -1202,29 +1466,61 @@ func (s *Sniffer) handleSessionEstablishmentResponse(smfSEID uint64, ieData []by
 			}
 		}
 	})
-	
-	if upfSEID != 0 {
-		// Heuristic: Match with the most recently created PENDING session (within last 5s)
-		// This is necessary because we don't track proper PFCP Transaction IDs yet.
-		sessions := s.correlation.GetAllSessions()
-		var candidate *Session
-		var newestTime time.Time
-		
-		for _, sess := range sessions {
-			if sess.EstablishmentStatus == EstablishmentPending && sess.CreatedAt.After(newestTime) {
-				newestTime = sess.CreatedAt
-				candidate = sess
-			}
-		}
-		
-		if candidate != nil {
-			// Check if created recently (e.g. < 5 seconds)
-			if time.Since(candidate.CreatedAt) < 5*time.Second {
-				log.Printf("   └─ Mapping UPF SEID 0x%x -> Internal SEID 0x%x (for UE %s)", upfSEID, candidate.SEID, candidate.UEIP)
-				s.correlation.RegisterRemoteSEID(upfSEID, candidate.SEID)
-			}
-		}
+
+	// Cause=1 is "Request accepted". Do not turn a rejected response into an
+	// active session. Cause is mandatory in a standards-compliant response.
+	if !causeSeen || cause != 1 {
+		log.Printf("[PFCP] Session Establishment Response rejected or missing Cause: SMF_SEID=0x%x UPF=%s Cause=%d",
+			smfSEID, upfIP, cause)
+		return
 	}
+
+	if candidate, ok := s.correlation.ConfirmSessionEstablishment(upfIP, smfSEID, upfSEID); ok {
+		s.applyCreatedPDRs(ieData, candidate)
+		log.Printf("   └─ Establishment accepted: CP F-SEID 0x%x, UP F-SEID 0x%x -> observation 0x%x (UE %s)",
+			smfSEID,
+			upfSEID, candidate.SEID, candidate.UEIP)
+	} else {
+		log.Printf("[PFCP] Accepted Establishment Response has no exact CP F-SEID match: CP_F-SEID=0x%x UPF=%s",
+			smfSEID, upfIP)
+	}
+}
+
+func extractTopLevelFSEID(ieData []byte) uint64 {
+	var seid uint64
+	parseImmediateIEs(ieData, func(ieType uint16, ieValue []byte) {
+		if seid == 0 && ieType == IETypeFSEID && len(ieValue) >= 9 {
+			seid = binary.BigEndian.Uint64(ieValue[1:9])
+		}
+	})
+	return seid
+}
+
+func (s *Sniffer) applyCreatedPDRs(ieData []byte, session *Session) {
+	if session == nil {
+		return
+	}
+	endpoints := make([]CreatedPDRFTEID, 0)
+	parseImmediateIEs(ieData, func(ieType uint16, ieValue []byte) {
+		if ieType != IETypeCreatedPDR {
+			return
+		}
+		endpoint := CreatedPDRFTEID{}
+		parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+			switch childType {
+			case IETypePDRID:
+				if len(childValue) >= 2 {
+					endpoint.PDRID = binary.BigEndian.Uint16(childValue[:2])
+				}
+			case IETypeFTEID:
+				endpoint.TEID, endpoint.IP = extractFTEID(childValue)
+			}
+		})
+		if endpoint.PDRID != 0 && (endpoint.TEID != 0 || endpoint.IP != nil) {
+			endpoints = append(endpoints, endpoint)
+		}
+	})
+	s.correlation.ApplyCreatedPDRFTEIDs(session.SEID, endpoints)
 }
 
 // extractSessionInfo extracts DNN, QFI, and other session info from PFCP IEs
@@ -1232,20 +1528,9 @@ func (s *Sniffer) extractSessionInfo(ieData []byte, session *Session) {
 	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
 		switch ieType {
 		case IETypeNetworkInstance: // Network Instance (DNN)
-			if len(ieValue) > 0 {
-				// DNN is encoded as a string (may have length prefix)
-				dnn := string(ieValue)
-				// Clean up the DNN string
-				if len(dnn) > 0 && dnn[0] < 32 {
-					// Has length prefix, skip it
-					if len(ieValue) > 1 {
-						dnn = string(ieValue[1:])
-					}
-				}
-				if len(dnn) > 0 {
-					session.DNN = dnn
-					log.Printf("   └─ Found DNN: %s", dnn)
-				}
+			if dnn := decodeNetworkInstance(ieValue); dnn != "" {
+				session.DNN = dnn
+				log.Printf("   └─ Found DNN: %s", dnn)
 			}
 		case IETypeQFI: // QFI
 			if len(ieValue) >= 1 {
@@ -1257,41 +1542,25 @@ func (s *Sniffer) extractSessionInfo(ieData []byte, session *Session) {
 			// - UL MBR: 5 bytes (40 bits) in kbps
 			// - DL MBR: 5 bytes (40 bits) in kbps
 			// Total: 10 bytes
-			log.Printf("   └─ MBR IE length: %d bytes, content: %x", len(ieValue), ieValue)
 			if len(ieValue) >= 10 {
-				// 5 bytes each: use 40-bit encoding
-				ulMBR := uint64(0)
-				dlMBR := uint64(0)
-				for i := 0; i < 5; i++ {
-					ulMBR = (ulMBR << 8) | uint64(ieValue[i])
-					dlMBR = (dlMBR << 8) | uint64(ieValue[5+i])
-				}
-				session.MBRUplink = ulMBR
-				session.MBRDownlink = dlMBR
-				log.Printf("   └─ Found MBR (10-byte): UL=%d kbps, DL=%d kbps", session.MBRUplink, session.MBRDownlink)
-			} else if len(ieValue) >= 8 {
-				// Fallback: 4 bytes each (32-bit)
-				session.MBRUplink = uint64(binary.BigEndian.Uint32(ieValue[0:4]))
-				session.MBRDownlink = uint64(binary.BigEndian.Uint32(ieValue[4:8]))
-				log.Printf("   └─ Found MBR (8-byte): UL=%d kbps, DL=%d kbps", session.MBRUplink, session.MBRDownlink)
-			} else if len(ieValue) >= 4 {
-				// Single direction (uplink only or downlink only)
-				// This seems to be the case in current SMF implementation
-				session.MBRUplink = uint64(binary.BigEndian.Uint32(ieValue[0:4]))
-				log.Printf("   └─ Found MBR (4-byte, UL only): UL=%d kbps", session.MBRUplink)
+				session.MBRUplink = decodeUint40(ieValue[0:5])
+				session.MBRDownlink = decodeUint40(ieValue[5:10])
+				log.Printf("   └─ Found MBR: UL=%d kbps, DL=%d kbps",
+					session.MBRUplink, session.MBRDownlink)
 			}
 		case IETypeGBR: // Guaranteed Bit Rate
-			if len(ieValue) >= 8 {
-				session.GBRUplink = uint64(binary.BigEndian.Uint32(ieValue[0:4]))
-				session.GBRDownlink = uint64(binary.BigEndian.Uint32(ieValue[4:8]))
-				log.Printf("   └─ Found GBR: UL=%d kbps, DL=%d kbps", session.GBRUplink, session.GBRDownlink)
+			if len(ieValue) >= 10 {
+				session.GBRUplink = decodeUint40(ieValue[0:5])
+				session.GBRDownlink = decodeUint40(ieValue[5:10])
+				log.Printf("   └─ Found GBR: UL=%d kbps, DL=%d kbps",
+					session.GBRUplink, session.GBRDownlink)
 			}
 		case IETypePrecedence: // Precedence (can indicate QoS priority)
 			if len(ieValue) >= 4 {
 				precedence := binary.BigEndian.Uint32(ieValue[0:4])
 				log.Printf("   └─ Found Precedence: %d", precedence)
 			}
-		case IETypePDUSessionType: // PDU Session Type
+		case IETypePDNType:
 			if len(ieValue) >= 1 {
 				pduType := ieValue[0] & 0x07 // Lower 3 bits
 				switch pduType {
@@ -1302,24 +1571,13 @@ func (s *Sniffer) extractSessionInfo(ieData []byte, session *Session) {
 				case 3:
 					session.SessionType = "IPv4v6"
 				case 4:
-					session.SessionType = "Unstructured"
+					session.SessionType = "Non-IP"
 				case 5:
 					session.SessionType = "Ethernet"
 				default:
 					session.SessionType = fmt.Sprintf("Type-%d", pduType)
 				}
-				log.Printf("   └─ Found PDU Session Type: %s", session.SessionType)
-			}
-		case IEType5QI: // 5QI (5G QoS Identifier)
-			if len(ieValue) >= 1 {
-				session.QoS5QI = ieValue[0]
-				log.Printf("   └─ Found 5QI: %d", session.QoS5QI)
-			}
-		case IETypeARP: // ARP (Allocation and Retention Priority)
-			if len(ieValue) >= 1 {
-				// ARP IE format: Priority Level (4 bits) + PCI (1 bit) + PVI (1 bit) + spare (2 bits)
-				session.ARPPL = (ieValue[0] >> 4) & 0x0F // Upper 4 bits are priority level
-				log.Printf("   └─ Found ARP Priority Level: %d", session.ARPPL)
+				log.Printf("   └─ Found PDN Type: %s", session.SessionType)
 			}
 		case IETypeSNSSAI: // S-NSSAI
 			if len(ieValue) >= 1 {
@@ -1342,85 +1600,489 @@ func (s *Sniffer) extractSessionInfo(ieData []byte, session *Session) {
 	})
 }
 
-// extractFTEIDDetails extracts F-TEID and Outer Header Creation details
-// For ULCL: Outer Header Creation in i-upf's FAR points to psa-upf (N9 interface)
-// For single UPF: Outer Header Creation points to gNB (N3)
+const (
+	pfcpInterfaceAccess = 0
+	pfcpInterfaceCore   = 1
+	pfcpInterfaceN6     = 2
+
+	tgppInterfaceN3Min = 11
+	tgppInterfaceN3Max = 14
+	tgppInterfaceN9    = 15
+	tgppInterfaceN6    = 17
+)
+
+// extractFTEIDDetails extracts topology facts from each FAR's forwarding
+// parameters. It deliberately avoids classifying peers by address ranges.
+//
+// Destination=Core with a GTP-U outer header is N9 towards the data network.
+// Destination=Access may be either N3 or N9, so it remains an access peer
+// unless the optional 3GPP Interface Type IE identifies it explicitly.
 func (s *Sniffer) extractFTEIDDetails(ieData []byte, session *Session) {
-	// Known UPF IPs in ULCL configuration (could be made configurable)
-	// For now, we detect UPF IPs by checking common UPF IP patterns
-	isUPFIP := func(ip net.IP) bool {
-		// Check if IP is in 10.100.200.x range (free5gc-compose network)
-		// UPFs are typically at .2, .3, .4 etc, while gNB is at higher addresses like .15
-		if ip4 := ip.To4(); ip4 != nil {
-			if ip4[0] == 10 && ip4[1] == 100 && ip4[2] == 200 {
-				// UPFs are typically in lower addresses (2-10), gNB is typically higher
-				return ip4[3] >= 2 && ip4[3] <= 10
-			}
-		}
-		return false
-	}
-
 	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
-		// Outer Header Creation contains the destination for forwarded packets
-		if ieType == IETypeOuterHeaderCreation && len(ieValue) >= 10 {
-			// Flags (2) + TEID (4) + IPv4 (4)
-			ip := net.IP(make([]byte, 4))
-			copy(ip, ieValue[6:10])
+		if ieType != IETypeForwardingParameters && ieType != 11 {
+			return
+		}
 
-			// Skip if it's the same as this UPF's IP
+		destinationInterface := -1
+		interfaceType := -1
+		outerPeers := make([]net.IP, 0, 1)
+
+		parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+			switch childType {
+			case IETypeDestinationInterface:
+				if len(childValue) > 0 {
+					destinationInterface = int(childValue[0] & 0x0f)
+				}
+			case IEType3GPPInterfaceType:
+				if len(childValue) > 0 {
+					interfaceType = int(childValue[0] & 0x3f)
+				}
+			case IETypeOuterHeaderCreation:
+				if ip := extractOuterHeaderCreationIP(childValue); ip != nil {
+					outerPeers = append(outerPeers, ip)
+				}
+			}
+		})
+
+		if destinationInterface == pfcpInterfaceN6 || interfaceType == tgppInterfaceN6 {
+			session.HasN6 = true
+		}
+
+		for _, ip := range outerPeers {
 			if session.UPFIP != nil && ip.Equal(session.UPFIP) {
-				return
+				continue
 			}
 
-			// Determine if this is N9 (peer UPF) or N3 (gNB) based on IP
-			if isUPFIP(ip) {
-				// This is likely another UPF (N9 peer)
-				if session.N9PeerIP == nil {
-					session.N9PeerIP = ip
-					log.Printf("   └─ Outer Header Creation N9 peer UPF: %s", ip)
+			switch {
+			case interfaceType == tgppInterfaceN9:
+				direction := ""
+				if destinationInterface == pfcpInterfaceCore {
+					direction = "towards-core"
+				} else if destinationInterface == pfcpInterfaceAccess {
+					direction = "towards-access"
 				}
-			} else {
-				// This is likely gNB (N3)
-				if session.GNBIP == nil {
-					session.GNBIP = ip
-					log.Printf("   └─ Outer Header Creation gNB (N3): %s", ip)
-				}
+				setN9Peer(session, ip, direction, "pfcp:3gpp-interface-type-n9")
+			case interfaceType >= tgppInterfaceN3Min && interfaceType <= tgppInterfaceN3Max:
+				session.GNBIP = cloneIP(ip)
+				log.Printf("   └─ PFCP 3GPP Interface Type identifies N3 peer: %s", ip)
+			case destinationInterface == pfcpInterfaceCore:
+				setN9Peer(session, ip, "towards-core", "pfcp:destination-interface-core")
+			case destinationInterface == pfcpInterfaceAccess:
+				session.AccessPeerIP = cloneIP(ip)
+				log.Printf("   └─ PFCP access-side peer awaiting graph correlation: %s", ip)
 			}
 		}
 	})
 }
 
-// extractGNBIPFromModification extracts gNB IP from Session Modification
-// This is where gNB's F-TEID info is provided after gNB responds to AMF
-func (s *Sniffer) extractGNBIPFromModification(ieData []byte, session *Session) {
-	s.parseIEsRecursive(ieData, func(ieType uint16, ieValue []byte) {
-		// Outer Header Creation in Session Modification contains gNB endpoint
-		// This is in FAR (Forwarding Action Rules) for downlink
-		if ieType == IETypeOuterHeaderCreation && len(ieValue) >= 10 {
-			// Flags (2) + TEID (4) + IPv4 (4)
-			ip := net.IP(ieValue[6:10])
-			// Only update gNB IP if it's different from UPF IP
-			if session.UPFIP == nil || !ip.Equal(session.UPFIP) {
-				session.GNBIP = ip
-				log.Printf("   └─ Outer Header gNB IP: %s", ip)
-			}
-		}
-		// Also check F-TEID in Update FAR which may contain gNB info
-		if ieType == IETypeFTEID && len(ieValue) >= 5 {
-			flags := ieValue[0]
-			offset := 5 // Skip flags (1) + TEID (4)
+func setN9Peer(session *Session, ip net.IP, direction, evidence string) {
+	if session.N9PeerIP != nil && !session.N9PeerIP.Equal(ip) {
+		log.Printf("   └─ Additional N9 peer ignored by single-path session model: %s", ip)
+		return
+	}
+	session.N9PeerIP = cloneIP(ip)
+	session.N9Direction = direction
+	session.N9Evidence = evidence
+	log.Printf("   └─ PFCP identifies N9 peer: %s (%s, %s)", ip, direction, evidence)
+}
 
-			// Check for IPv4 address (bit 0)
-			if flags&0x01 != 0 && len(ieValue) >= offset+4 {
-				ip := net.IP(ieValue[offset : offset+4])
-				// If this IP is different from UPF IP, it's likely gNB IP
-				if session.UPFIP != nil && !ip.Equal(session.UPFIP) {
-					session.GNBIP = ip
-					log.Printf("   └─ F-TEID gNB IP from Modification: %s", ip)
-				}
+func cloneIP(ip net.IP) net.IP {
+	if ip == nil {
+		return nil
+	}
+	cloned := make(net.IP, len(ip))
+	copy(cloned, ip)
+	return cloned
+}
+
+// extractOuterHeaderCreationIP parses the first IP destination from an Outer
+// Header Creation IE without assuming IPv4 or a fixed field offset.
+func extractOuterHeaderCreationIP(value []byte) net.IP {
+	if len(value) < 2 {
+		return nil
+	}
+
+	description := value[0]
+	offset := 2
+	hasTEID := description&0x03 != 0
+	hasIPv4 := description&(0x01|0x04|0x10) != 0
+	hasIPv6 := description&(0x02|0x08|0x20) != 0
+
+	if hasTEID {
+		if len(value) < offset+4 {
+			return nil
+		}
+		offset += 4
+	}
+	if hasIPv4 {
+		if len(value) < offset+4 {
+			return nil
+		}
+		return cloneIP(net.IP(value[offset : offset+4]))
+	}
+	if hasIPv6 {
+		if len(value) < offset+16 {
+			return nil
+		}
+		return cloneIP(net.IP(value[offset : offset+16]))
+	}
+	return nil
+}
+
+func extractOuterHeaderCreation(value []byte) (uint32, net.IP) {
+	if len(value) < 2 {
+		return 0, nil
+	}
+	description := value[0]
+	offset := 2
+	var teid uint32
+	if description&0x03 != 0 {
+		if len(value) < offset+4 {
+			return 0, nil
+		}
+		teid = binary.BigEndian.Uint32(value[offset : offset+4])
+		offset += 4
+	}
+	if description&(0x01|0x04|0x10) != 0 {
+		if len(value) < offset+4 {
+			return teid, nil
+		}
+		return teid, cloneIP(net.IP(value[offset : offset+4]))
+	}
+	if description&(0x02|0x08|0x20) != 0 {
+		if len(value) < offset+16 {
+			return teid, nil
+		}
+		return teid, cloneIP(net.IP(value[offset : offset+16]))
+	}
+	return teid, nil
+}
+
+// extractFTEID returns only fields that are physically present in the IE. A
+// zero TEID with the CH flag means the UPF must allocate the endpoint and is
+// therefore not reported as an observed TEID until a Created PDR is captured.
+func extractFTEID(value []byte) (uint32, net.IP) {
+	if len(value) < 5 {
+		return 0, nil
+	}
+	flags := value[0]
+	teid := binary.BigEndian.Uint32(value[1:5])
+	offset := 5
+	if flags&0x01 != 0 {
+		if len(value) < offset+4 {
+			return teid, nil
+		}
+		return teid, cloneIP(net.IP(value[offset : offset+4]))
+	}
+	if flags&0x02 != 0 {
+		if len(value) < offset+16 {
+			return teid, nil
+		}
+		return teid, cloneIP(net.IP(value[offset : offset+16]))
+	}
+	return teid, nil
+}
+
+func decodeNetworkInstance(value []byte) string {
+	if len(value) == 0 {
+		return ""
+	}
+	labels := make([]string, 0, 3)
+	for offset := 0; offset < len(value); {
+		length := int(value[offset])
+		offset++
+		if length == 0 || offset+length > len(value) {
+			labels = nil
+			break
+		}
+		labels = append(labels, string(value[offset:offset+length]))
+		offset += length
+	}
+	if len(labels) > 0 {
+		return strings.Join(labels, ".")
+	}
+	return strings.TrimSpace(strings.Trim(string(value), "\x00"))
+}
+
+func decodeUint40(value []byte) uint64 {
+	if len(value) < 5 {
+		return 0
+	}
+	var decoded uint64
+	for _, octet := range value[:5] {
+		decoded = decoded<<8 | uint64(octet)
+	}
+	return decoded
+}
+
+func decodeSDFFlowDescription(value []byte) string {
+	// SDF Filter: flags/spare (2), then FD length and flow description when
+	// the FD flag is present. Other optional fields follow the description.
+	if len(value) < 4 || value[0]&0x01 == 0 {
+		return ""
+	}
+	length := int(binary.BigEndian.Uint16(value[2:4]))
+	if length == 0 || 4+length > len(value) {
+		return ""
+	}
+	return strings.TrimSpace(string(value[4 : 4+length]))
+}
+
+func sdfDestinationSelector(description, ueIP string) string {
+	fields := strings.Fields(description)
+	fromIndex, toIndex := -1, -1
+	for index, field := range fields {
+		switch strings.ToLower(field) {
+		case "from":
+			fromIndex = index
+		case "to":
+			toIndex = index
+		}
+	}
+	if fromIndex < 0 || toIndex < 0 || fromIndex+1 >= len(fields) || toIndex+1 >= len(fields) {
+		return ""
+	}
+	from := strings.Trim(fields[fromIndex+1], "[]")
+	to := strings.Trim(fields[toIndex+1], "[]")
+	isUE := func(endpoint string) bool {
+		host := strings.Split(endpoint, "/")[0]
+		return ueIP != "" && host == ueIP
+	}
+	isDefault := func(endpoint string) bool {
+		switch strings.ToLower(endpoint) {
+		case "any", "assigned", "0.0.0.0/0", "::/0":
+			return true
+		default:
+			return false
+		}
+	}
+	if !isUE(to) && !isDefault(to) {
+		return to
+	}
+	if !isUE(from) && !isDefault(from) {
+		return from
+	}
+	return ""
+}
+
+func flowPathType(rule FlowRule) string {
+	if rule.OuterDst != nil {
+		switch {
+		case rule.InterfaceType == tgppInterfaceN9 || rule.DestinationInterface == pfcpInterfaceCore:
+			return "n9"
+		case rule.InterfaceType >= tgppInterfaceN3Min && rule.InterfaceType <= tgppInterfaceN3Max:
+			return "n3"
+		case rule.DestinationInterface == pfcpInterfaceAccess:
+			return "access-tunnel"
+		default:
+			return "tunnel"
+		}
+	}
+	if rule.DestinationInterface == pfcpInterfaceN6 ||
+		rule.InterfaceType == tgppInterfaceN6 ||
+		rule.DestinationInterface == pfcpInterfaceCore {
+		return "n6"
+	}
+	if rule.DestinationInterface >= 0 || rule.InterfaceType >= 0 {
+		return "local"
+	}
+	return ""
+}
+
+func parseForwardingRule(value []byte, previous ForwardingRule) ForwardingRule {
+	rule := previous
+	if rule.DestinationInterface == 0 && previous.FARID == 0 {
+		rule.DestinationInterface = -1
+		rule.InterfaceType = -1
+	}
+	parseImmediateIEs(value, func(ieType uint16, ieValue []byte) {
+		switch ieType {
+		case IETypeFARID:
+			if len(ieValue) >= 4 {
+				rule.FARID = binary.BigEndian.Uint32(ieValue[:4])
 			}
+		case IETypeApplyAction:
+			if len(ieValue) > 0 {
+				rule.ApplyAction = ieValue[0]
+			}
+		case IETypeForwardingParameters, IETypeUpdateForwarding:
+			parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+				switch childType {
+				case IETypeDestinationInterface:
+					if len(childValue) > 0 {
+						rule.DestinationInterface = int(childValue[0] & 0x0f)
+					}
+				case IEType3GPPInterfaceType:
+					if len(childValue) > 0 {
+						rule.InterfaceType = int(childValue[0] & 0x3f)
+					}
+				case IETypeNetworkInstance:
+					rule.NetworkInstance = decodeNetworkInstance(childValue)
+				case IETypeOuterHeaderCreation:
+					rule.OuterTEID, rule.OuterDst = extractOuterHeaderCreation(childValue)
+				}
+			})
 		}
 	})
+	return rule
+}
+
+func parsePDRFlowRule(value []byte, previous FlowRule, ueIP string) FlowRule {
+	rule := previous
+	if rule.SourceInterface == 0 && previous.PDRID == 0 {
+		rule.SourceInterface = -1
+		rule.SourceInterfaceType = -1
+		rule.DestinationInterface = -1
+		rule.InterfaceType = -1
+	}
+	parseImmediateIEs(value, func(ieType uint16, ieValue []byte) {
+		switch ieType {
+		case IETypePDRID:
+			if len(ieValue) >= 2 {
+				rule.PDRID = binary.BigEndian.Uint16(ieValue[:2])
+			}
+		case IETypePrecedence:
+			if len(ieValue) >= 4 {
+				rule.Precedence = binary.BigEndian.Uint32(ieValue[:4])
+			}
+		case IETypeFARID:
+			if len(ieValue) >= 4 {
+				rule.FARID = binary.BigEndian.Uint32(ieValue[:4])
+			}
+		case IETypePDI:
+			parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+				switch childType {
+				case IETypeSourceInterface:
+					if len(childValue) > 0 {
+						rule.SourceInterface = int(childValue[0] & 0x0f)
+					}
+				case IEType3GPPInterfaceType:
+					if len(childValue) > 0 {
+						rule.SourceInterfaceType = int(childValue[0] & 0x3f)
+					}
+				case IETypeFTEID:
+					rule.LocalFTEID, rule.LocalFTEIDIP = extractFTEID(childValue)
+				case IETypeNetworkInstance:
+					rule.PDINetworkInstance = decodeNetworkInstance(childValue)
+					rule.NetworkInstance = rule.PDINetworkInstance
+				case IETypeSDFFilter:
+					rule.SDFObserved = true
+					rule.SDF = decodeSDFFlowDescription(childValue)
+					rule.DestinationSelector = sdfDestinationSelector(rule.SDF, ueIP)
+				}
+			})
+		}
+	})
+	return rule
+}
+
+// extractFlowRules maintains the PDR -> FAR graph carried by PFCP. The result
+// can represent multiple simultaneous ULCL paths and therefore replaces the
+// old single N9PeerIP/HasN6 summary for topology construction.
+func (s *Sniffer) extractFlowRules(ieData []byte, session *Session) {
+	fars := make(map[uint32]ForwardingRule, len(session.ForwardingRules))
+	for _, far := range session.ForwardingRules {
+		fars[far.FARID] = far
+	}
+	pdrs := make(map[uint16]FlowRule, len(session.FlowRules))
+	for _, pdr := range session.FlowRules {
+		pdrs[pdr.PDRID] = pdr
+	}
+
+	parseImmediateIEs(ieData, func(ieType uint16, ieValue []byte) {
+		switch ieType {
+		case IETypeCreateFAR, IETypeUpdateFAR:
+			// Read the ID first so an Update FAR can merge omitted fields.
+			var id uint32
+			parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+				if childType == IETypeFARID && len(childValue) >= 4 {
+					id = binary.BigEndian.Uint32(childValue[:4])
+				}
+			})
+			fars[id] = parseForwardingRule(ieValue, fars[id])
+		case IETypeRemoveFAR:
+			parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+				if childType == IETypeFARID && len(childValue) >= 4 {
+					delete(fars, binary.BigEndian.Uint32(childValue[:4]))
+				}
+			})
+		case IETypeCreatePDR, IETypeUpdatePDR:
+			var id uint16
+			parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+				if childType == IETypePDRID && len(childValue) >= 2 {
+					id = binary.BigEndian.Uint16(childValue[:2])
+				}
+			})
+			ueIP := ""
+			if session.UEIP != nil {
+				ueIP = session.UEIP.String()
+			}
+			pdrs[id] = parsePDRFlowRule(ieValue, pdrs[id], ueIP)
+		case IETypeRemovePDR:
+			parseImmediateIEs(ieValue, func(childType uint16, childValue []byte) {
+				if childType == IETypePDRID && len(childValue) >= 2 {
+					delete(pdrs, binary.BigEndian.Uint16(childValue[:2]))
+				}
+			})
+		}
+	})
+
+	session.ForwardingRules = session.ForwardingRules[:0]
+	for _, far := range fars {
+		session.ForwardingRules = append(session.ForwardingRules, far)
+	}
+	session.FlowRules = session.FlowRules[:0]
+	session.HasN6 = false
+	session.N9PeerIP = nil
+	session.N9Direction = ""
+	session.N9Evidence = ""
+	for _, pdr := range pdrs {
+		// These fields came from the previously joined FAR. Clear them before
+		// rebuilding so a removed FAR cannot leave a stale forwarding path.
+		pdr.DestinationInterface = -1
+		pdr.InterfaceType = -1
+		pdr.OuterDst = nil
+		pdr.OuterTEID = 0
+		pdr.PathType = ""
+		pdr.NetworkInstance = pdr.PDINetworkInstance
+		if far, ok := fars[pdr.FARID]; ok {
+			pdr.DestinationInterface = far.DestinationInterface
+			pdr.InterfaceType = far.InterfaceType
+			if pdr.NetworkInstance == "" {
+				pdr.NetworkInstance = far.NetworkInstance
+			}
+			pdr.OuterDst = cloneIP(far.OuterDst)
+			pdr.OuterTEID = far.OuterTEID
+		}
+		pdr.PathType = flowPathType(pdr)
+		if pdr.PathType == "n6" {
+			session.HasN6 = true
+		}
+		if pdr.PathType == "n9" && pdr.OuterDst != nil && session.N9PeerIP == nil {
+			session.N9PeerIP = cloneIP(pdr.OuterDst)
+			session.N9Evidence = "pfcp:pdr-far"
+			switch pdr.DestinationInterface {
+			case pfcpInterfaceCore:
+				session.N9Direction = "towards-core"
+			case pfcpInterfaceAccess:
+				session.N9Direction = "towards-access"
+			}
+		}
+		session.FlowRules = append(session.FlowRules, pdr)
+	}
+}
+
+func parseImmediateIEs(data []byte, callback func(ieType uint16, ieValue []byte)) {
+	for offset := 0; offset+4 <= len(data); {
+		ieType := binary.BigEndian.Uint16(data[offset : offset+2])
+		ieLen := int(binary.BigEndian.Uint16(data[offset+2 : offset+4]))
+		end := offset + 4 + ieLen
+		if ieLen == 0 || end > len(data) {
+			return
+		}
+		callback(ieType, data[offset+4:end])
+		offset = end
+	}
 }
 
 // extractTEIDs extracts F-TEIDs (UPF's own TEIDs) from PFCP IEs (including nested IEs)
@@ -1575,15 +2237,157 @@ func (s *Sniffer) GetCorrelation() *Correlation {
 
 // UpdateUplinkPeer updates the uplink peer IP for a session
 func (c *Correlation) UpdateUplinkPeer(teid uint32, peerIP net.IP) {
+	c.UpdateGTPUplink(teid, peerIP, nil)
+}
+
+// UpdateGTPUplink records both endpoints observed on an uplink GTP-U packet.
+// peerIP is the gNB/access peer and upfN3IP is the local UPF N3 endpoint.
+func (c *Correlation) UpdateGTPUplink(teid uint32, peerIP, upfN3IP net.IP) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	if seid, ok := c.teidMap[teid]; ok {
 		if session, ok := c.sessions[seid]; ok {
-			if session.UplinkPeerIP == nil || !session.UplinkPeerIP.Equal(peerIP) {
+			if peerIP != nil && !peerIP.IsUnspecified() &&
+				(session.UplinkPeerIP == nil || !session.UplinkPeerIP.Equal(peerIP)) {
 				session.UplinkPeerIP = peerIP
 				log.Printf("[PFCP] Updated Uplink Peer IP for SEID 0x%x: %s", session.SEID, peerIP)
 			}
+			if upfN3IP != nil && !upfN3IP.IsUnspecified() &&
+				(session.UPFN3IP == nil || !session.UPFN3IP.Equal(upfN3IP)) {
+				session.UPFN3IP = upfN3IP
+				log.Printf("[PFCP] Updated UPF N3 IP for SEID 0x%x: %s", session.SEID, upfN3IP)
+			}
 		}
+	}
+}
+
+// RecordGTPFlow correlates a GTP-U ingress packet using TEID, the local outer
+// destination, and the inner UE endpoint. TEID alone is not unique in an ULCL
+// graph. Also, tunnel ingress may carry uplink or downlink PDU traffic; the
+// inner UE endpoint determines its actual direction.
+func (c *Correlation) RecordGTPFlow(
+	teid uint32,
+	outerSrc, outerDst, innerSrc, innerDst net.IP,
+	pduBytes uint32,
+) (*Session, bool) {
+	if teid == 0 || innerSrc == nil || innerDst == nil ||
+		innerSrc.IsUnspecified() || innerDst.IsUnspecified() {
+		return nil, false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	var candidate *Session
+	bestScore := -1
+	for _, session := range c.sessions {
+		hasTEID := false
+		for _, candidateTEID := range session.TEIDs {
+			if candidateTEID == teid {
+				hasTEID = true
+				break
+			}
+		}
+		if !hasTEID {
+			continue
+		}
+
+		score := 0
+		if outerDst != nil {
+			if session.UPFN3IP != nil && session.UPFN3IP.Equal(outerDst) {
+				score = 4
+			} else if session.UPFIP != nil && session.UPFIP.Equal(outerDst) {
+				score = 3
+			}
+		}
+		if session.UEIP != nil &&
+			(session.UEIP.Equal(innerSrc) || session.UEIP.Equal(innerDst)) {
+			score += 2
+		}
+		if score > bestScore {
+			bestScore = score
+			candidate = session
+		}
+	}
+	if candidate == nil {
+		return nil, false
+	}
+
+	direction := ""
+	var remoteEndpoint net.IP
+	switch {
+	case candidate.UEIP != nil && candidate.UEIP.Equal(innerSrc):
+		direction = "uplink"
+		remoteEndpoint = innerDst
+	case candidate.UEIP != nil && candidate.UEIP.Equal(innerDst):
+		direction = "downlink"
+		remoteEndpoint = innerSrc
+	default:
+		return nil, false
+	}
+
+	now := time.Now()
+	if outerSrc != nil && !outerSrc.IsUnspecified() &&
+		(candidate.N9PeerIP == nil || !candidate.N9PeerIP.Equal(outerSrc)) {
+		candidate.UplinkPeerIP = cloneIP(outerSrc)
+	}
+	if outerDst != nil && !outerDst.IsUnspecified() &&
+		(candidate.UPFIP == nil || candidate.UPFIP.Equal(outerDst)) {
+		candidate.UPFN3IP = cloneIP(outerDst)
+	}
+	for index := range candidate.FlowTraffic {
+		flow := &candidate.FlowTraffic[index]
+		if flow.Direction == direction && flow.DestIP.Equal(remoteEndpoint) {
+			flow.Packets++
+			flow.Bytes += uint64(pduBytes)
+			flow.LastActive = now
+			flow.OuterSrc = cloneIP(outerSrc)
+			flow.OuterDst = cloneIP(outerDst)
+			candidate.LastPacketTime = now
+			candidate.LastActive = now
+			candidate.DataPlaneStatus = DataPlaneActive
+			return candidate, true
+		}
+	}
+
+	candidate.FlowTraffic = append(candidate.FlowTraffic, FlowTraffic{
+		DestIP:     cloneIP(remoteEndpoint),
+		Packets:    1,
+		Bytes:      uint64(pduBytes),
+		LastActive: now,
+		OuterSrc:   cloneIP(outerSrc),
+		OuterDst:   cloneIP(outerDst),
+		Direction:  direction,
+	})
+	candidate.LastPacketTime = now
+	candidate.LastActive = now
+	candidate.DataPlaneStatus = DataPlaneActive
+	return candidate, true
+}
+
+// RefreshSessionTrafficFromFlows derives session counters from observations
+// already correlated to one local UPF. The legacy TEID-only counter map cannot
+// do this safely because ULCL may reuse a TEID on N3 and N9.
+func (c *Correlation) RefreshSessionTrafficFromFlows() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for _, session := range c.sessions {
+		var packetsUL, packetsDL, bytesUL, bytesDL uint64
+		for _, flow := range session.FlowTraffic {
+			switch flow.Direction {
+			case "uplink":
+				packetsUL += flow.Packets
+				bytesUL += flow.Bytes
+			case "downlink":
+				packetsDL += flow.Packets
+				bytesDL += flow.Bytes
+			}
+		}
+		session.PacketsUL = packetsUL
+		session.PacketsDL = packetsDL
+		session.BytesUL = bytesUL
+		session.BytesDL = bytesDL
 	}
 }
