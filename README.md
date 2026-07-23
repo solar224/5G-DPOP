@@ -10,6 +10,11 @@
 - Discovers UE, gNB, UPF, N3, N9, N6, and DN paths without fixed UPF counts, addresses, container names, or DN selectors.
 - Supports native free5GC and containerized free5GC deployments, including ULCL paths.
 
+## Required Repositories
+
+- [`solar224/gtp5g-DPOP`](https://github.com/solar224/gtp5g-DPOP.git) provides the compatible `gtp5g` kernel module and eBPF hook points.
+- [`free5gc/free5gc-compose`](https://github.com/free5gc/free5gc-compose) provides the containerized free5GC and ULCL test environment used by the Quick Start.
+
 ## Documentation
 
 - [Quick Start](docs/quick-start.md)

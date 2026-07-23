@@ -4,7 +4,20 @@ This path starts the free5GC ULCL example and 5G-DPOP on the same Ubuntu host. S
 
 ## One-Time Preparation
 
-The following assumes that the repositories exist at `~/gtp5g-DPOP`, `~/5G-DPOP`, and `~/free5gc-compose`. Stop any running UPFs before installing or reloading the kernel module.
+On a clean host, clone 5G-DPOP and the two repositories used by this ULCL workflow:
+
+```bash
+git clone https://github.com/solar224/5G-DPOP.git ~/5G-DPOP
+git clone https://github.com/solar224/gtp5g-DPOP.git ~/gtp5g-DPOP
+git clone https://github.com/free5gc/free5gc-compose.git ~/free5gc-compose
+```
+
+- [`solar224/gtp5g-DPOP`](https://github.com/solar224/gtp5g-DPOP.git) is the compatible kernel module required by the eBPF agent.
+- [`free5gc/free5gc-compose`](https://github.com/free5gc/free5gc-compose) supplies the free5GC ULCL core and UERANSIM environment.
+
+If a repository already exists at the target path, keep the existing clone instead of cloning it again.
+
+Stop any running UPFs before installing or reloading the kernel module, then prepare and build 5G-DPOP:
 
 ```bash
 cd ~/5G-DPOP
